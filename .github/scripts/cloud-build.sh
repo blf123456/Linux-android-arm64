@@ -32,12 +32,12 @@ cloud_main() {
     rm -f -- "$DRIVER_SRC/lsdriver.ko" "$DRIVER_SRC/$version.ko"
 
     cd "$kernel_dir"
-    log_info "Fetching official Android manifest: $branch"
+    log_info "Fetching official Android manifest: common-$branch"
     curl --fail --location --retry 5 --retry-all-errors \
         https://storage.googleapis.com/git-repo-downloads/repo -o repo
     chmod +x repo
     ./repo init -u https://android.googlesource.com/kernel/manifest \
-        -b "$branch" --depth=1 --no-clone-bundle
+        -b "common-$branch" --depth=1 --no-clone-bundle
     ./repo manifest -o manifest.xml
 
     # Sync only the kernel. Userspace/UI submodules and complete Android trees are unnecessary.
