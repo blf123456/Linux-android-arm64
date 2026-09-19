@@ -99,10 +99,17 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Reserve disk for the official kernel build
+      - name: Reserve memory and disk for the official kernel build
         run: |
           # These unused SDKs are on this disposable hosted runner only.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          # Full-LTO vmlinux links (especially Android 12/13) can exceed RAM.
+          # Add capacity without changing LTO, CFI or any kernel configuration.
+          sudo fallocate -l 24G "$RUNNER_TEMP/kernel-build.swap"
+          sudo chmod 600 "$RUNNER_TEMP/kernel-build.swap"
+          sudo mkswap "$RUNNER_TEMP/kernel-build.swap"
+          sudo swapon "$RUNNER_TEMP/kernel-build.swap"
+          free -h
           df -h "$RUNNER_TEMP"
       - name: Install build dependencies
         run: |
