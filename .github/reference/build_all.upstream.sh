@@ -9,8 +9,7 @@
 #    Legacy 构建: 5.10-Android12
 #
 #  用法:
-#    GitHub Actions: bash build_all.sh --cloud 6.6-Android15
-#    已准备好本地内核目录: bash build_all.sh [版本...]
+#    chmod +x build.sh && ./build.sh
 #
 # ==============================================================
 
@@ -19,10 +18,10 @@ set -euo pipefail
 BUILD_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # 内核源码根目录 (各版本源码存放在此目录下的子文件夹)
-KERNELS_ROOT="${KERNELS_ROOT:-$BUILD_ROOT/.kernels}"
+KERNELS_ROOT="/root"
 
 # 驱动源码路径
-DRIVER_SRC="${DRIVER_SRC:-$BUILD_ROOT/lsdriver}"
+DRIVER_SRC="/mnt/e/1.CodeRepository/Android/Kernel/lsdriver"
 
 # 强制不剥离符号的版本列表 (剥离后无法加载)
 NO_STRIP_VERSIONS=("6.18-Android17" "6.12-Android16" "6.6-Android15")
@@ -140,14 +139,6 @@ handle_output() {
         return 1
     fi
 
-    # Preserve actual commands before clean_driver_build removes Kbuild files.
-    if [[ -n "${CLOUD_ARTIFACT_DIR:-}" ]]; then
-        "$clang_path/bin/clang" --version > "$CLOUD_ARTIFACT_DIR/module-compiler.txt"
-        cp "$DRIVER_SRC/lsdriver.mod.c" "$CLOUD_ARTIFACT_DIR/lsdriver.mod.c"
-        (cd "$DRIVER_SRC" && find . -name '*.cmd' -type f -print0 |
-            tar --null -T - -czf "$CLOUD_ARTIFACT_DIR/module-commands.tar.gz")
-    fi
-
     # 检查是否属于强制不剥离版本
     local force_no_strip=false
     if contains_version "$version" "${NO_STRIP_VERSIONS[@]}"; then
@@ -193,18 +184,13 @@ build_kernel() {
 
     local kernel_dir="$KERNELS_ROOT/$version"
 
-    if [[ ! -x "$clang_path/bin/clang" ]]; then
-        log_error "找不到作者指定的工具链: $clang_path"
-        return 1
-    fi
-
     log_title
     log_warn "正在开始编译内核版本: $version"
 
     if [[ ! -d "$kernel_dir" ]]; then
         log_error "错误: 找不到内核目录 $kernel_dir"
         BUILD_RESULTS+=("$version: ❌ 目录不存在")
-        return 1
+        return
     fi
 
     log_warn "正在清理旧的构建产物..."
@@ -215,8 +201,7 @@ build_kernel() {
     local bazel_out
     bazel_out=$(readlink -f bazel-bin/common/kernel_aarch64 2>/dev/null || true)
 
-    if [[ -z "$bazel_out" || ! -s "$bazel_out/Module.symvers" ||
-          ! -f "$kernel_dir/bazel-bin/common/kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz" ]]; then
+    if [[ -z "$bazel_out" || ! -d "$bazel_out" ]]; then
         log_warn "检测到 $version 未进行内核编译，尝试 Bazel build..."
         tools/bazel build //common:kernel_aarch64 //common:kernel_aarch64_modules_prepare
         bazel_out=$(readlink -f bazel-bin/common/kernel_aarch64)
@@ -224,8 +209,9 @@ build_kernel() {
 
     # 解压 modules_prepare 环境
     cd "$bazel_out" || return
-    tar -xzf "$kernel_dir/bazel-bin/common/kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz"
-    test -s .config
+    if [[ -f "../kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz" ]]; then
+        tar -xzf ../kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz
+    fi
 
     # --- 编译模块 ---
     cd "$kernel_dir" || return
@@ -315,7 +301,7 @@ build_legacy_kernel() {
     if [[ ! -d "$kernel_dir" ]]; then
         log_error "错误: 找不到内核目录 $kernel_dir"
         BUILD_RESULTS+=("$version: ❌ 目录不存在")
-        return 1
+        return
     fi
 
     log_warn "正在清理旧的构建产物..."
@@ -463,30 +449,15 @@ build_legacy_kernel() {
 
 
 
-build_selected_kernel() {
-    case "$1" in
-        6.18-Android17) build_kernel "$1" "$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r584948c" aarch64-linux-gnu- 'CLANG_TRIPLE=aarch64-linux-gnu-' ;;
-        6.12-Android16) build_kernel "$1" "$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r536225" aarch64-linux-gnu- 'CLANG_TRIPLE=aarch64-linux-gnu-' ;;
-        6.6-Android15) build_kernel "$1" "$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r510928" aarch64-linux-gnu- 'CLANG_TRIPLE=aarch64-linux-gnu-' ;;
-        6.1-Android14) build_kernel "$1" "$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r487747c" aarch64-linux-gnu- "LLVM_TOOLCHAIN_PATH=$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r487747c" ;;
-        5.15-Android13) build_kernel "$1" "$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r450784e" aarch64-linux-gnu- "LLVM_TOOLCHAIN_PATH=$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r450784e" ;;
-        5.10-Android13) build_kernel "$1" "$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r450784e" aarch64-linux-gnu- "LLVM_TOOLCHAIN_PATH=$KERNELS_ROOT/$1/prebuilts/clang/host/linux-x86/clang-r450784e KBUILD_MODPOST_WARN=1" ;;
-        5.10-Android12) build_legacy_kernel ;;
-        *) log_error "Unsupported kernel version: $1"; return 2 ;;
-    esac
-}
-
 main() {
     local requested_versions=("$@")
 
     trap cleanup_driver_build_on_exit EXIT
 
-    if [[ -z "${STRIP_CHOICE:-}" ]]; then
-        STRIP_CHOICE=n
-        if [[ -t 0 ]]; then
-            read -rp "是否剥离调试符号 (y/n，默认 n): " STRIP_CHOICE
-        fi
-    fi
+    log_warn "是否需要剥离(strip)符号？"
+    echo -e "  输入 ${GREEN}'y'${NC} 进行剥离 (减小体积)"
+    echo -e "  输入 ${GREEN}'n'${NC} 不剥离 (保留调试符号)"
+    read -rp "请输入 (y/n): " STRIP_CHOICE
 
 
     if [[ "$STRIP_CHOICE" != "y" && "$STRIP_CHOICE" != "Y" && \
@@ -506,13 +477,43 @@ main() {
         [[ ${#requested_versions[@]} -eq 0 ]] || contains_version "$1" "${requested_versions[@]}"
     }
 
-    local version
-    for version in 6.18-Android17 6.12-Android16 6.6-Android15 6.1-Android14 \
-                   5.15-Android13 5.10-Android13 5.10-Android12; do
-        if should_build "$version"; then
-            build_selected_kernel "$version"
-        fi
-    done
+    should_build "6.18-Android17" && build_kernel "6.18-Android17" \
+        "$KERNELS_ROOT/6.18-Android17/prebuilts/clang/host/linux-x86/clang-r584948c" \
+        "aarch64-linux-gnu-" \
+        "CLANG_TRIPLE=aarch64-linux-gnu-"
+
+    # 内核 6.12-Android16
+    should_build "6.12-Android16" && build_kernel "6.12-Android16" \
+        "$KERNELS_ROOT/6.12-Android16/prebuilts/clang/host/linux-x86/clang-r536225" \
+        "aarch64-linux-gnu-" \
+        "CLANG_TRIPLE=aarch64-linux-gnu-"
+
+    # 2. 内核 6.6-Android15
+    should_build "6.6-Android15" && build_kernel "6.6-Android15" \
+        "$KERNELS_ROOT/6.6-Android15/prebuilts/clang/host/linux-x86/clang-r510928" \
+        "aarch64-linux-gnu-" \
+        "CLANG_TRIPLE=aarch64-linux-gnu-"
+
+    # 3. 内核 6.1-Android14
+    should_build "6.1-Android14" && build_kernel "6.1-Android14" \
+        "$KERNELS_ROOT/6.1-Android14/prebuilts/clang/host/linux-x86/clang-r487747c" \
+        "aarch64-linux-gnu-" \
+        "LLVM_TOOLCHAIN_PATH=$KERNELS_ROOT/6.1-Android14/prebuilts/clang/host/linux-x86/clang-r487747c"
+
+    # 4. 内核 5.15-Android13
+    should_build "5.15-Android13" && build_kernel "5.15-Android13" \
+        "$KERNELS_ROOT/5.15-Android13/prebuilts/clang/host/linux-x86/clang-r450784e" \
+        "aarch64-linux-gnu-" \
+        "LLVM_TOOLCHAIN_PATH=$KERNELS_ROOT/5.15-Android13/prebuilts/clang/host/linux-x86/clang-r450784e"
+
+    # 5. 5.10-Android13
+    should_build "5.10-Android13" && build_kernel "5.10-Android13" \
+        "$KERNELS_ROOT/5.10-Android13/prebuilts/clang/host/linux-x86/clang-r450784e" \
+        "aarch64-linux-gnu-" \
+        "LLVM_TOOLCHAIN_PATH=$KERNELS_ROOT/5.10-Android13/prebuilts/clang/host/linux-x86/clang-r450784e KBUILD_MODPOST_WARN=1"
+
+    # 6. 5.10-Android12 (Legacy)
+    should_build "5.10-Android12" && build_legacy_kernel
 
     log_title
     echo ""
@@ -540,13 +541,4 @@ main() {
     log_title
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    if [[ "${1:-}" == "--cloud" ]]; then
-        shift
-        # 云端同步官方构建环境，并复用本文件的 Bazel/Legacy 编译函数。
-        source "$BUILD_ROOT/.github/scripts/cloud-build.sh"
-        cloud_main "$@"
-    else
-        main "$@"
-    fi
-fi
+main "$@"

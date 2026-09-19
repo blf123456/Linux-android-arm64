@@ -16,6 +16,38 @@ def shell_path(path):
 
 
 class BuildEnvironmentTest(unittest.TestCase):
+    def test_all_version_arguments_match_the_author_script(self):
+        harness = r'''
+source "$1"
+KERNELS_ROOT=/author-kernels
+DRIVER_SRC=/unused-driver-directory
+clean_driver_build() { :; }
+package_driver() { :; }
+ls() { :; }
+log_info() { :; }
+log_warn() { :; }
+log_error() { :; }
+log_title() { :; }
+build_kernel() { printf 'CALL'; printf ' <%s>' "$@"; printf '\n'; }
+build_legacy_kernel() { printf 'LEGACY\n'; }
+main < <(printf 'n\n')
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            # Do not execute the upstream script's entry point on the host.
+            upstream = ROOT / ".github/reference/build_all.upstream.sh"
+            source = upstream.read_text(encoding="utf-8").rsplit('main "$@"', 1)[0]
+            fixture = Path(directory) / "upstream-functions.sh"
+            fixture.write_text(source, encoding="utf-8", newline="\n")
+            calls = []
+            for path in (fixture, ROOT / "build_all.sh"):
+                result = subprocess.run([BASH, "-c", harness, "test", shell_path(path)],
+                                        capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls.append([line for line in result.stdout.splitlines()
+                              if line.startswith(("CALL", "LEGACY"))])
+            self.assertEqual(len(calls[0]), 7)
+            self.assertEqual(calls[0], calls[1])
+
     def run_build(self, version, *, fail=False, partial_cache=False, compiler=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
