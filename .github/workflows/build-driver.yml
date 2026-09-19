@@ -64,6 +64,7 @@ jobs:
           done
           python3 -m py_compile .github/scripts/clang-manifest.py .github/scripts/release-manifest.py
           python3 .github/scripts/test-kernel-matching.py
+          python3 .github/scripts/test-client-lifecycle.py
       - name: Select kernels
         id: matrix
         env:
