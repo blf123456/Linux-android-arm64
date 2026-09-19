@@ -27,15 +27,24 @@ TG:https://t.me/+ArHIx-Km9jkxNjZl
 
 支持 `5.10-Android12`、`5.10-Android13`、`5.15-Android13`、`6.1-Android14`、
 `6.6-Android15`、`6.12-Android16`、`6.18-Android17`。每个版本在独立的 GitHub 托管
-Ubuntu 运行器上下载 Android 官方内核源码及 manifest 指定的 Clang 工具链，然后使用
-GKI 配置执行 `modules_prepare` 和外部模块编译；无需完整编译或链接内核镜像。
+Ubuntu 运行器上同步 Android 官方 manifest 的完整构建依赖。Android 13+ 使用作者原脚本的
+`tools/bazel build //common:kernel_aarch64 //common:kernel_aarch64_modules_prepare`，
+解压其准备目录后编译模块；Android 12 使用 `build/build.sh` 初始化 Legacy 内核输出后
+执行 `modules_prepare`。云端和本地共用同一套编译函数及作者指定的 Clang 版本。
+完整内核构建比旧的直接 `gki_defconfig` 流程耗时更长，单版本超时上限为 180 分钟。
 
-工作流调用 `build_all.sh --cloud <版本>`，沿用原脚本的无 CRC 构建和符号处理规则；
+工作流调用 `build_all.sh --cloud <版本>`，保留 Bazel/Legacy 生成的配置，
+不再自行关闭 Rust、改写版本配置或回退到其他编译器。沿用原脚本的无 CRC 构建和符号处理规则；
 6.6、6.12、6.18 始终保留调试符号。单版本运行生成的安装脚本仅包含所选版本，
 完整安装脚本请选 `all`。只有所选版本全部构建成功才打包，避免发布缺少模块的安装包。
 产物保留 30 天，日志保留 14 天；请及时下载。云端打包不向仓库回写二进制或版本号。
 
-此工作流只编译 `lsdriver` 内核模块和安装脚本，不编译 Android 用户态界面。
+每次构建保存 `manifest.xml`（固定依赖提交）、`kernel.config`、`kernel-Module.symvers`、
+实际模块编译命令及 `module-audit.json`。已知的模块结构大小、入口 KCFI 类型标识、
+符号版本段或编译器差异会使构建失败。失败时也可下载 `diagnostics-<版本>`。
+详见 [编译差异与验证说明](docs/cloud-build-parity.md)。
+
+发布的驱动产物是 `lsdriver` 模块和安装脚本；为准备环境会编译内核，不编译 Android 用户态界面。
 编译成功不等于已在设备上验证加载兼容性；设备仍需匹配的内核及模块加载权限。
 
 ## 依赖初始化

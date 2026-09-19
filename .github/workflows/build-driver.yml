@@ -28,6 +28,7 @@ on:
       - 'packer.sh'
       - 'install_driver.version'
       - '.github/scripts/**'
+      - '.github/reference/**'
       - '.github/workflows/build-driver.yml'
   pull_request:
     paths:
@@ -36,6 +37,7 @@ on:
       - 'packer.sh'
       - 'install_driver.version'
       - '.github/scripts/**'
+      - '.github/reference/**'
       - '.github/workflows/build-driver.yml'
 
 permissions:
@@ -62,7 +64,8 @@ jobs:
           for script in build_all.sh packer.sh .github/scripts/cloud-build.sh; do
             bash -n "$script"
           done
-          python3 -m py_compile .github/scripts/clang-manifest.py .github/scripts/release-manifest.py
+          python3 -m py_compile .github/scripts/*.py
+          python3 .github/scripts/test-build-environment.py
           python3 .github/scripts/test-kernel-matching.py
           python3 .github/scripts/test-client-lifecycle.py
       - name: Select kernels
@@ -90,22 +93,27 @@ jobs:
     name: ${{ matrix.kernel }}
     needs: prepare
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reserve disk for the official kernel build
+        run: |
+          # These unused SDKs are on this disposable hosted runner only.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h "$RUNNER_TEMP"
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc binutils-aarch64-linux-gnu bison build-essential ca-certificates \
             cpio curl flex git kmod libdw-dev libelf-dev libssl-dev libtinfo5 \
-            lz4 pahole python3 rsync unzip xz-utils zlib1g-dev zstd
+            lz4 pahole python3 python3-pyelftools rsync unzip xz-utils zlib1g-dev zstd
           git config --global user.name github-actions
           git config --global user.email github-actions@github.com
-      - name: Download sources and compile in GitHub cloud
+      - name: Build with the author's Bazel or Legacy environment
         env:
           KERNEL_VERSION: ${{ matrix.kernel }}
           KERNELS_ROOT: ${{ runner.temp }}/kernels
@@ -129,6 +137,21 @@ jobs:
           path: logs/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Upload environment and ABI diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.kernel }}
+          path: |
+            artifacts/${{ matrix.kernel }}/*.txt
+            artifacts/${{ matrix.kernel }}/*.json
+            artifacts/${{ matrix.kernel }}/*.xml
+            artifacts/${{ matrix.kernel }}/*.config
+            artifacts/${{ matrix.kernel }}/*.symvers
+            artifacts/${{ matrix.kernel }}/*.mod.c
+            artifacts/${{ matrix.kernel }}/*.tar.gz
+          if-no-files-found: ignore
+          retention-days: 30
 
   package:
     name: Package drivers
