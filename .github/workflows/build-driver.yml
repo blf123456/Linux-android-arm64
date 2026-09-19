@@ -1,0 +1,181 @@
+name: Build Android ARM64 drivers
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: 内核版本（all 编译全部七个版本并生成完整安装脚本）
+        type: choice
+        default: all
+        options:
+          - all
+          - 6.18-Android17
+          - 6.12-Android16
+          - 6.6-Android15
+          - 6.1-Android14
+          - 5.15-Android13
+          - 5.10-Android13
+          - 5.10-Android12
+      strip:
+        description: 剥离调试符号（6.6 / 6.12 / 6.18 始终保留）
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'lsdriver/**'
+      - 'build_all.sh'
+      - 'packer.sh'
+      - 'install_driver.version'
+      - '.github/scripts/**'
+      - '.github/workflows/build-driver.yml'
+  pull_request:
+    paths:
+      - 'lsdriver/**'
+      - 'build_all.sh'
+      - 'packer.sh'
+      - 'install_driver.version'
+      - '.github/scripts/**'
+      - '.github/workflows/build-driver.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-driver-${{ github.workflow }}-${{ github.ref }}-${{ inputs.kernel || 'all' }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check build scripts
+        run: |
+          for script in build_all.sh packer.sh .github/scripts/cloud-build.sh; do
+            bash -n "$script"
+          done
+          python3 -m py_compile .github/scripts/clang-manifest.py
+      - name: Select kernels
+        id: matrix
+        env:
+          SELECTED_KERNEL: ${{ inputs.kernel || 'all' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          kernels = [
+              '6.18-Android17', '6.12-Android16', '6.6-Android15',
+              '6.1-Android14', '5.15-Android13', '5.10-Android13', '5.10-Android12',
+          ]
+          selected = os.environ['SELECTED_KERNEL']
+          if selected != 'all':
+              if selected not in kernels:
+                  raise SystemExit(f'Unsupported kernel: {selected}')
+              kernels = [selected]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps({'kernel': kernels}) + '\n')
+          PY
+
+  build:
+    name: ${{ matrix.kernel }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc binutils-aarch64-linux-gnu bison build-essential ca-certificates \
+            cpio curl flex git kmod libelf-dev libssl-dev libtinfo5 \
+            lz4 pahole python3 rsync unzip xz-utils zstd
+          git config --global user.name github-actions
+          git config --global user.email github-actions@github.com
+      - name: Download sources and compile in GitHub cloud
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel }}
+          KERNELS_ROOT: ${{ runner.temp }}/kernels
+          ARTIFACT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.kernel }}
+          STRIP_CHOICE: ${{ inputs.strip && 'y' || 'n' }}
+        run: |
+          mkdir -p logs
+          bash build_all.sh --cloud "$KERNEL_VERSION" 2>&1 | tee "logs/$KERNEL_VERSION.log"
+      - name: Upload driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-${{ matrix.kernel }}
+          path: artifacts/${{ matrix.kernel }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.kernel }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  package:
+    name: Package drivers
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: driver-*
+          path: downloaded
+      - name: Package only this run's modules
+        env:
+          BUILD_MATRIX: ${{ needs.prepare.outputs.matrix }}
+        run: |
+          mkdir -p release/modules release/build-info
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          versions = json.loads(os.environ['BUILD_MATRIX'])['kernel']
+          for version in versions:
+              source = pathlib.Path('downloaded') / ('driver-' + version)
+              module = source / (version + '.ko')
+              if not module.is_file() or module.stat().st_size == 0:
+                  raise SystemExit(f'Missing module: {version}')
+              shutil.copy2(module, 'lsdriver')
+              shutil.copy2(module, 'release/modules')
+              shutil.copytree(source, pathlib.Path('release/build-info') / version,
+                              ignore=shutil.ignore_patterns('*.ko'))
+          pathlib.Path('release/built-kernels.txt').write_text('\n'.join(versions) + '\n')
+          PY
+          # packer.sh embeds only modules built above. A single-version run produces
+          # an installer for that version; an all run produces the complete installer.
+          bash packer.sh
+          cp install_driver.sh release/
+          bash install_driver.sh --version > release/package-version.txt
+          (cd release && sha256sum install_driver.sh modules/*.ko > SHA256SUMS)
+          {
+            echo '### 云编译完成'
+            echo '下载 lsdriver-package，其中包含安装脚本、模块、构建信息和 SHA256 校验值。'
+            echo '本次安装脚本包含以下版本：'
+            cat release/built-kernels.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsdriver-package
+          path: release/
+          if-no-files-found: error
+          retention-days: 30

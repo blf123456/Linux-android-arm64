@@ -9,6 +9,35 @@ TG:https://t.me/+ArHIx-Km9jkxNjZl
 
 ---
 
+## GitHub Actions 纯云编译驱动
+
+无需在电脑上下载内核、安装工具链或运行编译命令，也不需要自建 runner、服务器或额外 Secrets。
+
+1. 打开仓库的 **Actions → Build Android ARM64 drivers → Run workflow**。
+2. `kernel` 选 `all` 编译全部七个版本，或选择一个版本；`strip` 默认关闭。
+3. 等待任务结束，在本次运行页面底部 **Artifacts** 下载 **lsdriver-package**。
+
+`main` 分支的驱动或构建配置更新也会自动触发全版本构建。Fork 后先在 Actions 页面启用工作流。
+
+| 产物 | 内容 |
+| --- | --- |
+| `lsdriver-package` | `install_driver.sh`、`modules/*.ko`、`built-kernels.txt`、构建信息和 SHA256 校验值 |
+| `driver-<版本>` | 单个版本的 `.ko`、内核配置和源码/编译器提交信息 |
+| `log-<版本>` | 编译日志，失败时也会保留 |
+
+支持 `5.10-Android12`、`5.10-Android13`、`5.15-Android13`、`6.1-Android14`、
+`6.6-Android15`、`6.12-Android16`、`6.18-Android17`。每个版本在独立的 GitHub 托管
+Ubuntu 运行器上下载 Android 官方内核源码及 manifest 指定的 Clang 工具链，然后使用
+GKI 配置执行 `modules_prepare` 和外部模块编译；无需完整编译或链接内核镜像。
+
+工作流调用 `build_all.sh --cloud <版本>`，沿用原脚本的无 CRC 构建和符号处理规则；
+6.6、6.12、6.18 始终保留调试符号。单版本运行生成的安装脚本仅包含所选版本，
+完整安装脚本请选 `all`。只有所选版本全部构建成功才打包，避免发布缺少模块的安装包。
+产物保留 30 天，日志保留 14 天；请及时下载。云端打包不向仓库回写二进制或版本号。
+
+此工作流只编译 `lsdriver` 内核模块和安装脚本，不编译 Android 用户态界面。
+编译成功不等于已在设备上验证加载兼容性；设备仍需匹配的内核及模块加载权限。
+
 ## 依赖初始化
 
 Capstone、Dear ImGui、nlohmann/json 和 BS::thread_pool 通过 Git 子模块引入，分别跟踪官方 `next`、`master`、`develop` 和 `master` 分支。
