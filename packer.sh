@@ -114,7 +114,6 @@ load_driver_logic() {
     echo "=========================================="
     printf '[-] 安装脚本版本: \033[1;93m%s\033[0m\n' "$INSTALL_DRIVER_VERSION"
     echo "[-] 内核版本: $KERNEL_VER"
-    echo "[-] 系统指纹: $BUILD_FINGERPRINT"
     echo "[-] 匹配分支: $desc"
     echo "[-] 提取位置: $TEMP_KO"
 
@@ -128,7 +127,6 @@ load_driver_logic() {
     fi
 
     echo "[-] 正在加载..."
-    dmesg -c >/dev/null 2>&1
     
     if OUTPUT=$(insmod "$TEMP_KO" 2>&1); then
         echo "[+] 成功: 驱动已加载！"
@@ -152,51 +150,43 @@ if [ "${1:-}" = "--version" ]; then
 fi
 
 KERNEL_VER=$(uname -r)
-BUILD_FINGERPRINT=$(getprop ro.build.fingerprint 2>/dev/null)
-
-if [ -z "$BUILD_FINGERPRINT" ]; then
-    BUILD_FINGERPRINT="unknown"
+KERNEL_BRANCH=$(printf '%s\n' "$KERNEL_VER" | sed -nE 's/^([0-9]+\.[0-9]+)([.-].*)?$/\1/p')
+ANDROID_KERNEL=$(printf '%s\n' "$KERNEL_VER" | tr '[:upper:]' '[:lower:]' | tr ' -+' '\n' | sed -nE 's/^android([0-9]+)([^0-9].*)?$/\1/p' | sort -u)
+if [ -z "$ANDROID_KERNEL" ]; then
+    ANDROID_KERNEL=$(cat /proc/version 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr ' -+' '\n' | sed -nE 's/^android([0-9]+)([^0-9].*)?$/\1/p' | sort -u)
 fi
 
-case "$KERNEL_VER" in
-    # 6.x 系列
-    6.18.*)
+case "$KERNEL_BRANCH:android$ANDROID_KERNEL" in
+    6.18:android17)
         load_driver_logic "payload_6_18" "6.18-Android17"
         ;;
-    6.12.*)
+    6.12:android16)
         load_driver_logic "payload_6_12" "6.12-Android16"
         ;;
-    6.6.*)
+    6.6:android15)
         load_driver_logic "payload_6_6" "6.6-Android15"
         ;;
-    6.1.*)
+    6.1:android14)
         load_driver_logic "payload_6_1" "6.1-Android14"
         ;;
     
     # 5.15 系列
-    5.15.*)
+    5.15:android13)
         load_driver_logic "payload_5_15" "5.15-Android13"
         ;;
     
     # 5.10 系列 (匹配内核名中的 android12 或 android13)
-    5.10.*android12*)
+    5.10:android12)
         load_driver_logic "payload_android12" "5.10-Android12"
         ;;
-    5.10.*android13*)
+    5.10:android13)
         load_driver_logic "payload_android13" "5.10-Android13"
-        ;;
-    
-    # 5.10 兜底 (如果内核名里没写 android 版本，默认试用 13)
-    5.10.*)
-        echo "[!] 警告: 5.10 内核但未识别到 android12/13 标签。"
-        echo "[!] 依次尝试 android13 -> android12..."
-        load_driver_logic "payload_android13" "5.10-Android13 (fallback)"
         ;;
     
     # 其他
     *)
-        echo "[!] 错误: 不支持的内核版本 ($KERNEL_VER)"
-        echo "[!] 支持: 5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18"
+        echo "[!] 没有对应主驱动或无法识别 Android 内核分支: $KERNEL_VER"
+        echo "[!] 按 Android 内核分支 + Linux 主次版本匹配，不参考系统版本、不猜测回退。"
         exit 1
         ;;
 esac

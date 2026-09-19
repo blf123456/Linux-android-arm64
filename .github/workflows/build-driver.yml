@@ -204,3 +204,29 @@ jobs:
           path: release/
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Publish app driver downloads
+    needs: package
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (inputs.kernel == '' || inputs.kernel == 'all')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: lsdriver-package
+          path: release
+      - name: Create verified manifest and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRIVER_TAG: drivers-${{ github.run_id }}
+        run: |
+          python3 .github/scripts/release-manifest.py
+          gh release create "$DRIVER_TAG" release/modules/*.ko release/driver-manifest.json \
+            release/SHA256SUMS release/install_driver.sh \
+            --target "$GITHUB_SHA" --title "lsdriver $DRIVER_TAG" \
+            --notes-file release/release-notes.md --latest
