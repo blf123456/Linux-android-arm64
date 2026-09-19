@@ -151,9 +151,9 @@ fi
 
 KERNEL_VER=$(uname -r)
 KERNEL_BRANCH=$(printf '%s\n' "$KERNEL_VER" | sed -nE 's/^([0-9]+\.[0-9]+)([.-].*)?$/\1/p')
-ANDROID_KERNEL=$(printf '%s\n' "$KERNEL_VER" | tr '[:upper:]' '[:lower:]' | tr ' -+' '\n' | sed -nE 's/^android([0-9]+)([^0-9].*)?$/\1/p' | sort -u)
+ANDROID_KERNEL=$(printf '%s\n' "$KERNEL_VER" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sed -nE 's/^android([0-9]+)$/\1/p' | sort -u)
 if [ -z "$ANDROID_KERNEL" ]; then
-    ANDROID_KERNEL=$(cat /proc/version 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr ' -+' '\n' | sed -nE 's/^android([0-9]+)([^0-9].*)?$/\1/p' | sort -u)
+    ANDROID_KERNEL=$(cat /proc/version 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sed -nE 's/^android([0-9]+)$/\1/p' | sort -u)
 fi
 
 case "$KERNEL_BRANCH:android$ANDROID_KERNEL" in

@@ -62,7 +62,8 @@ jobs:
           for script in build_all.sh packer.sh .github/scripts/cloud-build.sh; do
             bash -n "$script"
           done
-          python3 -m py_compile .github/scripts/clang-manifest.py
+          python3 -m py_compile .github/scripts/clang-manifest.py .github/scripts/release-manifest.py
+          python3 .github/scripts/test-kernel-matching.py
       - name: Select kernels
         id: matrix
         env:
