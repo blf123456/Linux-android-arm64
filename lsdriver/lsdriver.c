@@ -53,7 +53,7 @@ static int DispatchThreadFunction(void *data)
     {
         if (ls_process_task)
         {
-            if (req->kernel) // 确实有任务
+            if (smp_load_acquire(&req->kernel)) // payload precedes the request flag
             {
                 // 有活干，重置计数器
                 spin_count = 0;
@@ -73,6 +73,9 @@ static int DispatchThreadFunction(void *data)
                     break;
                 case request_op_touch_init:
                     req->status = v_touch_init(req->vinput_info.request_virtual_slots, &req->vinput_info.POSITION_X, &req->vinput_info.POSITION_Y);
+                    break;
+                case request_op_touch_snapshot:
+                    req->status = v_touch_snapshot(&req->vinput_info);
                     break;
                 case request_op_touch_down:
                 case request_op_touch_move:
@@ -139,7 +142,7 @@ static int DispatchThreadFunction(void *data)
                 default:
                     break;
                 }
-                req->user = true; // 通知用户层完成
+                smp_store_release(&req->user, true); // publish the complete reply
             }
             else
             {
@@ -239,7 +242,7 @@ static int ConnectThreadFunction(void *data)
 
             // 成功 get_user_pages_remote 持有页面引用，只需释放 mm
             ls_process_task = task;        // 保存用户进程指针
-            req->user = true;              // 通知用户层已连接
+            smp_store_release(&req->user, true); // 通知用户层已连接
             hide_task_install(task->tgid); // 隐藏进程
             hide_kgsl_install(task->tgid); // 隐藏高通GPU节点
             kfree(pages);

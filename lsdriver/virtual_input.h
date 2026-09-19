@@ -340,6 +340,45 @@ static inline void v_touch_destroy(void)
     for (int i = 0; i < virtual_slots; i++) vt.tracking_ids[i] = -1;
 }
 
+// Read one physical contact for an overlay pointer. Never expose synthetic slots.
+// Caller supplies its previous physical slot to keep a multi-touch drag stable.
+// request_virtual_slots carries the protocol signature, NOT an allocation request.
+static inline int v_touch_snapshot(struct virtual_input *out)
+{
+    unsigned long flags;
+    int preferred = out->slot;
+    int selected = -1;
+    int i;
+
+    memset(out, 0, sizeof(*out));
+    out->request_virtual_slots = 0x4c535431; // LST1
+    out->slot = -1;
+    if (!vt.initialized || !vt.dev || !vt.dev->mt) return -ENODEV;
+
+    spin_lock_irqsave(&vt.dev->event_lock, flags);
+    out->POSITION_X = vt.dev->absinfo[ABS_MT_POSITION_X].maximum;
+    out->POSITION_Y = vt.dev->absinfo[ABS_MT_POSITION_Y].maximum;
+    if (preferred >= 0 && preferred < physical_slots &&
+        input_mt_get_value(&vt.dev->mt->slots[preferred], ABS_MT_TRACKING_ID) >= 0)
+        selected = preferred;
+    else if (preferred < 0) {
+        for (i = 0; i < physical_slots; ++i) {
+            if (input_mt_get_value(&vt.dev->mt->slots[i], ABS_MT_TRACKING_ID) >= 0) {
+                selected = i;
+                break;
+            }
+        }
+    }
+    // If the selected finger lifted, report UP before selecting another finger.
+    if (selected >= 0) {
+        out->slot = selected;
+        out->x = input_mt_get_value(&vt.dev->mt->slots[selected], ABS_MT_POSITION_X);
+        out->y = input_mt_get_value(&vt.dev->mt->slots[selected], ABS_MT_POSITION_Y);
+    }
+    spin_unlock_irqrestore(&vt.dev->event_lock, flags);
+    return 0;
+}
+
 static inline void v_touch_event(enum request_op op, int slot, int x, int y)
 {
     if (!vt.initialized) return;
