@@ -66,6 +66,7 @@ jobs:
           done
           python3 -m py_compile .github/scripts/*.py
           python3 .github/scripts/test-build-environment.py
+          python3 .github/scripts/test-kernel-cache.py
           python3 .github/scripts/test-kernel-matching.py
           python3 .github/scripts/test-client-lifecycle.py
       - name: Select kernels
@@ -115,6 +116,8 @@ jobs:
           sudo mkswap "$RUNNER_TEMP/kernel-build.swap"
           sudo swapon "$RUNNER_TEMP/kernel-build.swap"
           free -h
+          nproc
+          lscpu | sed -n '1,20p'
           df -h "$RUNNER_TEMP"
       - name: Install build dependencies
         run: |

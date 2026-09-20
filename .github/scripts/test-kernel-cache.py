@@ -26,6 +26,12 @@ class KernelCacheTest(unittest.TestCase):
                     host = kernel / "build/build-tools/sysroot/usr/include"
                     host.mkdir(parents=True)
                     (host / "test.h").write_text("host header\n")
+                    prebuilt = kernel / "prebuilts/host/bin/make"
+                    prebuilt.parent.mkdir(parents=True)
+                    prebuilt.write_text("ELF with relative RUNPATH\n")
+                    shortcut = kernel / "build/build-tools/path/linux-x86/make"
+                    shortcut.parent.mkdir(parents=True)
+                    shortcut.symlink_to(prebuilt)
                 else:
                     binary = kernel / "out/bazel/execroot/workspace/bazel-out/bin"
                     output = binary / "common/kernel_aarch64"
@@ -33,11 +39,16 @@ class KernelCacheTest(unittest.TestCase):
                     prepare.mkdir(parents=True)
                     (prepare / "modules_prepare_outdir.tar.gz").write_bytes(b"prepare fixture")
                     (kernel / "bazel-bin").symlink_to(binary, target_is_directory=True)
+                    runtime = kernel / "prebuilts/kernel-build-tools/linux_musl-x86/lib64/libc_musl.so"
+                    runtime.parent.mkdir(parents=True)
+                    runtime.write_text("runtime\n")
                 output.mkdir(parents=True)
+                if not legacy:
+                    (output / "source").symlink_to("/removed-bazel-sandbox/common", target_is_directory=True)
                 (output / ".config").write_text("CONFIG_CFI_CLANG=y\n")
                 (output / "Module.symvers").write_text("original symbols\n")
                 # A Bazel output can point to a different action's generated file.
-                shared = kernel / "out/shared-generated-header"
+                shared = (output if legacy else kernel / "out") / "shared-generated-header"
                 shared.write_bytes(b"unchanged generated contents\x00\xff")
                 (output / "generated.h").symlink_to(shared)
                 (output / "generated.h").chmod(0o444)
@@ -61,8 +72,13 @@ class KernelCacheTest(unittest.TestCase):
                 self.assertEqual((output / ".config").read_text(), "CONFIG_CFI_CLANG=y\n")
                 if legacy:
                     self.assertEqual((host / "test.h").read_text(), "host header\n")
+                    self.assertTrue(shortcut.is_symlink())
+                    self.assertEqual(shortcut.resolve(), prebuilt)
                 else:
                     self.assertTrue((kernel / "bazel-bin/common/kernel_aarch64/.config").is_file())
+                    self.assertEqual(os.readlink(output / "source"), "/removed-bazel-sandbox/common")
+                    self.assertEqual((kernel / "out/bazel/execroot/workspace/prebuilts").resolve(),
+                                     kernel / "prebuilts")
                 original_manifest = manifest.read_bytes()
                 manifest.write_text("<manifest>different project revision</manifest>\n")
                 run("restore", success=False)
