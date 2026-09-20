@@ -99,13 +99,13 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       KERNEL_VERSION: ${{ matrix.kernel }}
-      KERNELS_ROOT: ${{ runner.temp }}/kernels
       ARTIFACT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.kernel }}
       STRIP_CHOICE: ${{ inputs.strip && 'y' || 'n' }}
     steps:
       - uses: actions/checkout@v4
       - name: Reserve memory and disk for the official kernel build
         run: |
+          echo "KERNELS_ROOT=$RUNNER_TEMP/kernels" >> "$GITHUB_ENV"
           # These unused SDKs are on this disposable hosted runner only.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           # Full-LTO vmlinux links (especially Android 12/13) can exceed RAM.
