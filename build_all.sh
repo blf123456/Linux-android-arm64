@@ -224,7 +224,12 @@ build_kernel() {
 
     # 解压 modules_prepare 环境
     cd "$bazel_out" || return
+    # Older Kleaf trees expose read-only Bazel outputs. The author's next
+    # operation overlays modules_prepare and Kbuild then writes into this tree.
+    # Change permissions only; keep every generated file and build argument.
+    chmod -R u+w "$bazel_out"
     tar -xzf "$kernel_dir/bazel-bin/common/kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz"
+    chmod -R u+w "$bazel_out"
     test -s .config
 
     # --- 编译模块 ---

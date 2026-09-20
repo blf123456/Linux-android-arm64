@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check build scripts
         run: |
-          for script in build_all.sh packer.sh .github/scripts/cloud-build.sh; do
+          for script in build_all.sh packer.sh .github/scripts/*.sh; do
             bash -n "$script"
           done
           python3 -m py_compile .github/scripts/*.py
@@ -97,6 +97,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      KERNEL_VERSION: ${{ matrix.kernel }}
+      KERNELS_ROOT: ${{ runner.temp }}/kernels
+      ARTIFACT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.kernel }}
+      STRIP_CHOICE: ${{ inputs.strip && 'y' || 'n' }}
     steps:
       - uses: actions/checkout@v4
       - name: Reserve memory and disk for the official kernel build
@@ -120,15 +125,54 @@ jobs:
             lz4 pahole python3 python3-pyelftools rsync unzip xz-utils zlib1g-dev zstd
           git config --global user.name github-actions
           git config --global user.email github-actions@github.com
-      - name: Build with the author's Bazel or Legacy environment
-        env:
-          KERNEL_VERSION: ${{ matrix.kernel }}
-          KERNELS_ROOT: ${{ runner.temp }}/kernels
-          ARTIFACT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.kernel }}
-          STRIP_CHOICE: ${{ inputs.strip && 'y' || 'n' }}
+      - name: Sync official sources and identify the exact environment
+        id: environment
         run: |
           mkdir -p logs
-          bash build_all.sh --cloud "$KERNEL_VERSION" 2>&1 | tee "logs/$KERNEL_VERSION.log"
+          bash build_all.sh --cloud "$KERNEL_VERSION" sync 2>&1 | tee "logs/$KERNEL_VERSION-sync.log"
+      - name: Restore the exact prepared kernel environment
+        id: kernel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/kernels/${{ matrix.kernel }}/module-environment-cache
+          key: ${{ steps.environment.outputs.cache-key }}
+      - name: Unpack the prepared environment
+        if: steps.kernel-cache.outputs.cache-hit == 'true'
+        run: bash .github/scripts/kernel-cache.sh restore
+      - name: Build with the author's Bazel or Legacy environment
+        run: |
+          vmstat 30 > "logs/$KERNEL_VERSION-resources.log" &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true; free -h; df -h "$RUNNER_TEMP"' EXIT
+          /usr/bin/time -v -o "$ARTIFACT_DIR/build-resources.txt" \
+            bash build_all.sh --cloud "$KERNEL_VERSION" build 2>&1 | tee "logs/$KERNEL_VERSION.log"
+      - name: Finalize reusable kernel outputs
+        run: |
+          if [[ '${{ steps.kernel-cache.outputs.cache-hit }}' != true ]]; then
+            bash .github/scripts/kernel-cache.sh save
+            # Verify the cache independently of the original output tree.
+            # Never save an environment that changes the resulting module.
+            cp "$ARTIFACT_DIR/$KERNEL_VERSION.ko" "$RUNNER_TEMP/module-before-cache.ko"
+            mv "$KERNELS_ROOT/$KERNEL_VERSION/out" "$KERNELS_ROOT/$KERNEL_VERSION/out-before-cache-check"
+            if [[ "$KERNEL_VERSION" == 5.10-Android12 ]]; then
+              mv "$KERNELS_ROOT/$KERNEL_VERSION/build/build-tools" "$KERNELS_ROOT/$KERNEL_VERSION/build/build-tools-before-cache-check"
+            fi
+            bash .github/scripts/kernel-cache.sh restore
+            bash build_all.sh --cloud "$KERNEL_VERSION" build 2>&1 | tee "logs/$KERNEL_VERSION-cache-check.log"
+            cmp "$RUNNER_TEMP/module-before-cache.ko" "$ARTIFACT_DIR/$KERNEL_VERSION.ko"
+            echo 'Cache reconstruction produced a byte-identical driver.'
+          fi
+          {
+            echo "### $KERNEL_VERSION"
+            echo "Prepared environment cache hit: ${{ steps.kernel-cache.outputs.cache-hit == 'true' }}"
+            du -h "$KERNELS_ROOT/$KERNEL_VERSION/module-environment-cache/environment.tar.zst"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Cache successful kernel preparation
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/kernels/${{ matrix.kernel }}/module-environment-cache
+          key: ${{ steps.environment.outputs.cache-key }}
       - name: Upload driver
         uses: actions/upload-artifact@v4
         with:

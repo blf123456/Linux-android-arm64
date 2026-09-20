@@ -48,7 +48,8 @@ main < <(printf 'n\n')
             self.assertEqual(len(calls[0]), 7)
             self.assertEqual(calls[0], calls[1])
 
-    def run_build(self, version, *, fail=False, partial_cache=False, compiler=True):
+    def run_build(self, version, *, fail=False, partial_cache=False, compiler=True,
+                  readonly_output=False, reuse=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kernel = root / "kernels" / version
@@ -82,6 +83,7 @@ if [ "$TEST_LEGACY" = 0 ]; then
     rmdir bazel-bin/common/kernel_aarch64 2>/dev/null || true
     ln -s "$TEST_OUT" bazel-bin/common/kernel_aarch64
     tar -C "$TEST_OUT" -czf bazel-bin/common/kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz .config
+    if [ "$TEST_READONLY" = 1 ]; then chmod -R a-w "$TEST_OUT"; fi
 fi
 """, newline="\n")
             prepare.chmod(0o755)
@@ -99,11 +101,16 @@ printf 'fresh module\\n' > "$DRIVER_SRC/lsdriver.ko"
             env = {**os.environ, "KERNELS_ROOT": shell_path(root / "kernels"),
                    "DRIVER_SRC": shell_path(driver), "STRIP_CHOICE": "n",
                    "TEST_ROOT": shell_path(root), "TEST_OUT": shell_path(output),
-                   "TEST_LEGACY": str(int(legacy)), "TEST_FAIL": str(int(fail))}
+                   "TEST_LEGACY": str(int(legacy)), "TEST_FAIL": str(int(fail)),
+                   "TEST_READONLY": str(int(readonly_output))}
             # Set PATH inside Bash to avoid Windows/MSYS PATH translation issues.
             command = 'export PATH="$TEST_ROOT/bin:$PATH"; source "$1"; build_selected_kernel "$2"'
             result = subprocess.run([BASH, "-c", command, "test", shell_path(ROOT / "build_all.sh"), version],
                                     env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
+            if reuse and result.returncode == 0:
+                (driver / (version + ".ko")).unlink()
+                result = subprocess.run([BASH, "-c", command, "test", shell_path(ROOT / "build_all.sh"), version],
+                                        env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
             return result, {name: (root / name).read_text() if (root / name).exists() else ""
                             for name in ("prepare.log", "make.log")}, \
                 (output / "Module.symvers").read_text() if (output / "Module.symvers").exists() else "", \
@@ -123,6 +130,23 @@ printf 'fresh module\\n' > "$DRIVER_SRC/lsdriver.ko"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("//common:kernel_aarch64_modules_prepare", logs["prepare.log"])
         self.assertTrue(module)
+
+    @unittest.skipIf(os.name == "nt", "Requires POSIX file permissions")
+    def test_readonly_bazel_output_can_be_overlaid_and_built(self):
+        result, _, symvers, module = self.run_build("6.6-Android15", readonly_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(symvers, "original kernel symbols\n")
+        self.assertTrue(module)
+
+    def test_reused_environment_still_rebuilds_the_driver(self):
+        for version in ("6.6-Android15", "5.10-Android12"):
+            with self.subTest(version=version):
+                result, logs, symvers, module = self.run_build(version, reuse=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(logs["prepare.log"].splitlines()), 1)
+                self.assertEqual(sum(arg.startswith("M=") for arg in logs["make.log"].split()), 2)
+                self.assertEqual(symvers, "original kernel symbols\n")
+                self.assertTrue(module)
 
     def test_legacy_uses_build_sh_before_modules_prepare(self):
         result, logs, symvers, module = self.run_build("5.10-Android12")

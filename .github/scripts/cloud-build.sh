@@ -3,11 +3,12 @@
 # local builds. Never synthesize a separate .config for cloud builds.
 
 cloud_main() {
-    if [[ $# -ne 1 ]]; then
-        log_error 'Usage: bash build_all.sh --cloud <kernel-version>'
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
+        log_error 'Usage: bash build_all.sh --cloud <kernel-version> [sync|build]'
         return 2
     fi
-    local version="$1" branch
+    local version="$1" phase="${2:-all}" branch
+    [[ "$phase" =~ ^(all|sync|build)$ ]] || return 2
     case "$version" in
         6.18-Android17) branch=android17-6.18 ;;
         6.12-Android16) branch=android16-6.12 ;;
@@ -31,6 +32,7 @@ cloud_main() {
     rm -f -- "$DRIVER_SRC/lsdriver.ko" "$DRIVER_SRC/$version.ko"
 
     cd "$kernel_dir"
+    if [[ "$phase" != build ]]; then
     log_info "Syncing official build environment: common-$branch"
     curl --fail --location --retry 5 --retry-all-errors \
         https://storage.googleapis.com/git-repo-downloads/repo -o repo
@@ -41,6 +43,29 @@ cloud_main() {
         -b "${MANIFEST_REVISION:-common-$branch}" --depth=1 --no-clone-bundle
     ./repo sync -c --no-tags --no-clone-bundle --fail-fast -j"$jobs"
     ./repo manifest -r -o "$artifact_dir/manifest.xml"
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        local cache_hash
+        cache_hash=$({
+            cat "$artifact_dir/manifest.xml" "$BUILD_ROOT/build_all.sh" \
+                "$BUILD_ROOT/.github/scripts/cloud-build.sh" \
+                "$BUILD_ROOT/.github/scripts/kernel-cache.sh" \
+                "$BUILD_ROOT/.github/workflows/build-driver.yml"
+            printf '%s\n' "$kernel_dir" "$BUILD_ROOT" "$(uname -m)" \
+                "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+        } | sha256sum | cut -d ' ' -f 1)
+        printf 'cache-key=kernel-env-v1-%s-%s\n' "$version" "$cache_hash" >> "$GITHUB_OUTPUT"
+    fi
+    fi
+    [[ "$phase" != sync ]] || return 0
+    test -s "$artifact_dir/manifest.xml"
+
+    if [[ "$version" == 5.10-Android12 ]]; then
+        # HOSTCFLAGS uses the author's hermetic sysroot. Do not let the runner's
+        # pkg-config advertise /usr/lib YAML libraries whose headers are outside
+        # that sysroot. The official build's restricted PATH also excludes them.
+        export PKG_CONFIG_PATH=
+        export PKG_CONFIG_LIBDIR="$kernel_dir/build/build-tools/sysroot/usr/lib/pkgconfig:$kernel_dir/build/build-tools/sysroot/usr/share/pkgconfig"
+    fi
 
     # Compiler paths/revisions and make arguments are shared with local builds.
     # Missing author toolchains are errors, never silent compiler fallbacks.
