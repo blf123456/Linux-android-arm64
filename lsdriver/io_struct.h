@@ -312,9 +312,6 @@ enum request_op
 
     request_op_kernel_exit, // 内核线程退出
 
-    // Versioned, non-overlapping extension. Reuses virtual_input, no ABI resize.
-    request_op_touch_snapshot = 0x4c530100,
-
 };
 
 // 将在队列中使用的请求实例结构体

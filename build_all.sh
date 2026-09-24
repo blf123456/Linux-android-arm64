@@ -9,8 +9,7 @@
 #    Legacy 构建: 5.10-Android12
 #
 #  用法:
-#    GitHub Actions: bash build_all.sh --cloud 6.6-Android15
-#    已准备好本地内核目录: bash build_all.sh [版本...]
+#    chmod +x build.sh && ./build.sh
 #
 # ==============================================================
 
@@ -19,10 +18,10 @@ set -euo pipefail
 BUILD_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # 内核源码根目录 (各版本源码存放在此目录下的子文件夹)
-KERNELS_ROOT="${KERNELS_ROOT:-$BUILD_ROOT/.kernels}"
+KERNELS_ROOT="/root"
 
 # 驱动源码路径
-DRIVER_SRC="${DRIVER_SRC:-$BUILD_ROOT/lsdriver}"
+DRIVER_SRC="/mnt/e/1.CodeRepository/Android/Kernel/lsdriver"
 
 # 强制不剥离符号的版本列表 (剥离后无法加载)
 NO_STRIP_VERSIONS=("6.18-Android17" "6.12-Android16" "6.6-Android15")
@@ -191,7 +190,7 @@ build_kernel() {
     if [[ ! -d "$kernel_dir" ]]; then
         log_error "错误: 找不到内核目录 $kernel_dir"
         BUILD_RESULTS+=("$version: ❌ 目录不存在")
-        return 1
+        return
     fi
 
     log_warn "正在清理旧的构建产物..."
@@ -302,7 +301,7 @@ build_legacy_kernel() {
     if [[ ! -d "$kernel_dir" ]]; then
         log_error "错误: 找不到内核目录 $kernel_dir"
         BUILD_RESULTS+=("$version: ❌ 目录不存在")
-        return 1
+        return
     fi
 
     log_warn "正在清理旧的构建产物..."
@@ -455,12 +454,10 @@ main() {
 
     trap cleanup_driver_build_on_exit EXIT
 
-    if [[ -z "${STRIP_CHOICE:-}" ]]; then
-        STRIP_CHOICE=n
-        if [[ -t 0 ]]; then
-            read -rp "是否剥离调试符号 (y/n，默认 n): " STRIP_CHOICE
-        fi
-    fi
+    log_warn "是否需要剥离(strip)符号？"
+    echo -e "  输入 ${GREEN}'y'${NC} 进行剥离 (减小体积)"
+    echo -e "  输入 ${GREEN}'n'${NC} 不剥离 (保留调试符号)"
+    read -rp "请输入 (y/n): " STRIP_CHOICE
 
 
     if [[ "$STRIP_CHOICE" != "y" && "$STRIP_CHOICE" != "Y" && \
@@ -544,11 +541,4 @@ main() {
     log_title
 }
 
-if [[ "${1:-}" == "--cloud" ]]; then
-    shift
-    # 云端模式自动获取官方源码与工具链，只准备外部模块所需的内核环境。
-    source "$BUILD_ROOT/.github/scripts/cloud-build.sh"
-    cloud_main "$@"
-else
-    main "$@"
-fi
+main "$@"

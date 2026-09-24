@@ -15,8 +15,6 @@
 #include <linux/list.h>
 #include <linux/kobject.h>
 #include <linux/kallsyms.h>
-#include <linux/mutex.h>
-#include <linux/rcupdate.h>
 
 #include "io_struct.h"
 #include "export_fun.h"
@@ -35,71 +33,30 @@
 #include "virtual_memory_enum.h"
 #include "break_point.h"
 
-static struct request_obj *req;
-static struct task_struct *connect_thread_task;
-static struct task_struct *dispatch_thread_task;
-/* session_lock protects the task reference, mapping, pages and input lifetime. */
-static DEFINE_MUTEX(session_lock);
-static struct task_struct *ls_process_task;
-static struct page **session_pages;
-static int session_num_pages;
-static bool driver_stopping;
+static struct request_obj *req = NULL;
 
-static bool ls_client_alive(struct task_struct *task)
-{
-    /* A held task reference also retains signal_struct. The leader can exit
-     * while other threads are still using the shared mapping. */
-    return task && pid_alive(task) && atomic_read(&task->signal->live) > 0;
-}
+/*
+volatile 约束，这三个指针的每次读写都按易变访问处理，
+适合在线程循环中持续轮询生命周期状态。
+不约束指针指向内存地址
 
-/* Worker context only, with session_lock held; never from an inline exit hook. */
-static void ls_disconnect_locked(void)
-{
-    struct task_struct *task = ls_process_task;
-    if (!task) return;
-
-    ls_log_always_tag("session", "disconnect tgid=%d\n", task->tgid);
-    v_touch_destroy();
-    v_gnss_destroy();
-    v_gyro_destroy();
-    remove_process_hwbp();
-    remove_process_ptebp();
-    remove_process_dptdbg();
-    remove_process_stepbp();
-    syscall_monitor_remove_all();
-    cntvct_monitor_remove_all();
-    hide_task_remove(task->tgid);
-    hide_kgsl_remove(task->tgid);
-
-    if (req) vunmap(req);
-    req = NULL;
-    release_gup_pages(session_pages, session_num_pages);
-    kfree(session_pages);
-    session_pages = NULL;
-    session_num_pages = 0;
-    ls_process_task = NULL;
-    put_task_struct(task);
-}
+*/
+struct task_struct *volatile connect_thread_task = 0;
+struct task_struct *volatile dispatch_thread_task = 0;
+struct task_struct *volatile ls_process_task = 0;
 
 static int DispatchThreadFunction(void *data)
 {
     // 自旋计数器：用来记录我们空转了多久
     int spin_count = 0;
-    while (!kthread_should_stop() && !READ_ONCE(driver_stopping))
+    while (dispatch_thread_task)
     {
-        bool handled = false;
-        bool connected;
-        mutex_lock(&session_lock);
-        if (ls_process_task && !ls_client_alive(ls_process_task))
-            ls_disconnect_locked();
-        connected = ls_process_task != NULL;
         if (ls_process_task)
         {
-            if (smp_load_acquire(&req->kernel)) // payload precedes the request flag
+            if (req->kernel) // 确实有任务
             {
                 // 有活干，重置计数器
                 spin_count = 0;
-                handled = true;
 
                 req->kernel = false; // 清除请求标志
 
@@ -116,9 +73,6 @@ static int DispatchThreadFunction(void *data)
                     break;
                 case request_op_touch_init:
                     req->status = v_touch_init(req->vinput_info.request_virtual_slots, &req->vinput_info.POSITION_X, &req->vinput_info.POSITION_Y);
-                    break;
-                case request_op_touch_snapshot:
-                    req->status = v_touch_snapshot(&req->vinput_info);
                     break;
                 case request_op_touch_down:
                 case request_op_touch_move:
@@ -179,114 +133,134 @@ static int DispatchThreadFunction(void *data)
                 case request_op_kernel_exit:
                     hide_task_remove(connect_thread_task->pid);
                     hide_task_remove(dispatch_thread_task->pid);
-                    WRITE_ONCE(driver_stopping, true);
+                    connect_thread_task = NULL;  // 标记连接线程退出
+                    dispatch_thread_task = NULL; // 标记调度线程退出
                     break;
                 default:
                     break;
                 }
-                smp_store_release(&req->user, true); // publish the complete reply
+                req->user = true; // 通知用户层完成
+            }
+            else
+            {
+                // 暂时没活干
+
+                // 策略：前 5000 次循环死等（极速响应），超过后才睡觉
+                if (spin_count < 5000)
+                {
+                    spin_count++;
+                    cpu_relax(); // 告诉 CPU 我在忙等，降低功耗
+                }
+                else
+                {
+                    // 既不占 CPU，也能快速醒来
+                    usleep_range(50, 100);
+
+                    // 这里不要重置 spin_count，
+                    // 保持睡眠状态直到下一个任务到来，做到了有任务超高性能响应，没任务超低消耗;
+                }
             }
         }
-        mutex_unlock(&session_lock);
-        if (!connected)
+        else
         {
-            msleep(20);
+            // 还没连接到进程，深睡眠
+            msleep(2000);
         }
-        else if (handled) cond_resched();
-        else if (spin_count++ < 5000) cpu_relax();
-        else { spin_count = 5000; usleep_range(50, 100); }
     }
-    mutex_lock(&session_lock);
-    ls_disconnect_locked();
-    mutex_unlock(&session_lock);
-    return 0;
-}
-
-/* Take a reference under RCU, then leave RCU before GUP/vmap can sleep. */
-static struct task_struct *ls_find_client(void)
-{
-    struct task_struct *task;
-    struct task_struct *candidate = NULL;
-    char comm[TASK_COMM_LEN];
-    rcu_read_lock();
-    for_each_process(task)
-    {
-        get_task_comm(comm, task);
-        if (__builtin_strcmp(comm, "LS") || !ls_client_alive(task)) continue;
-        if (candidate && task->start_time <= candidate->start_time) continue;
-        candidate = task;
-    }
-    if (candidate) get_task_struct(candidate);
-    rcu_read_unlock();
-    return candidate;
-}
-
-/* Caller owns task and holds session_lock. Success transfers its reference. */
-static int ls_attach_locked(struct task_struct *task)
-{
-    struct mm_struct *mm;
-    struct page **pages;
-    struct request_obj *mapped;
-    int num_pages = DIV_ROUND_UP(sizeof(struct request_obj), PAGE_SIZE);
-    int ret;
-
-    if (ls_process_task) return -EBUSY;
-    if (!ls_client_alive(task)) return -ESRCH;
-    mm = get_task_mm(task);
-    if (!mm) return -ESRCH;
-    pages = kmalloc_array(num_pages, sizeof(*pages), GFP_KERNEL);
-    if (!pages) { mmput(mm); return -ENOMEM; }
-    mmap_read_lock(mm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
-    ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
-#else
-    ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
-#endif
-    mmap_read_unlock(mm);
-    mmput(mm);
-    if (ret != num_pages)
-    {
-        release_gup_pages(pages, ret > 0 ? ret : 0);
-        kfree(pages);
-        return ret < 0 ? ret : -EFAULT;
-    }
-    mapped = vmap(pages, num_pages, VM_MAP, PAGE_KERNEL);
-    if (!mapped || !ls_client_alive(task))
-    {
-        if (mapped) vunmap(mapped);
-        release_gup_pages(pages, num_pages);
-        kfree(pages);
-        return mapped ? -ESRCH : -ENOMEM;
-    }
-
-    req = mapped;
-    session_pages = pages;
-    session_num_pages = num_pages;
-    ls_process_task = task;
-    /* Never kill an old client to establish a new connection. */
-    smp_store_release(&req->user, true);
-    hide_task_install(task->tgid);
-    hide_kgsl_install(task->tgid);
-    ls_log_always_tag("session", "connected tgid=%d pages=%d\n", task->tgid, num_pages);
     return 0;
 }
 
 static int ConnectThreadFunction(void *data)
 {
-    while (!kthread_should_stop() && !READ_ONCE(driver_stopping))
+    struct task_struct *task;
+    struct mm_struct *mm = NULL;
+    struct page **pages = NULL;
+    int num_pages;
+    int ret;
+
+    // 和内核线程在运行
+    while (connect_thread_task)
     {
-        struct task_struct *candidate;
-        mutex_lock(&session_lock);
-        if (ls_process_task && !ls_client_alive(ls_process_task))
-            ls_disconnect_locked();
-        if (!ls_process_task && !READ_ONCE(driver_stopping))
+
+        // 遍历系统中所有进程,//这里不加RCU锁，不然会导致6.6以上超时
+        for_each_process(task)
         {
-            candidate = ls_find_client();
-            if (candidate && ls_attach_locked(candidate)) put_task_struct(candidate);
+            if (__builtin_strcmp(task->comm, "LS") != 0) continue;
+
+            // 这次的task是旧task跳过
+            if (task == ls_process_task) continue;
+            // 这次的task启动时间小于旧task跳过
+            if (ls_process_task && task->start_time <= ls_process_task->start_time) continue;
+
+            // 获取进程的内存描述符
+            mm = get_task_mm(task);
+            if (!mm) continue;
+
+            // 计算页数
+            num_pages = (sizeof(struct request_obj) + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            // 分配页指针数组
+            pages = kmalloc_array(num_pages, sizeof(struct page *), GFP_KERNEL);
+            if (!pages)
+            {
+                ls_log_tag("core", "kmalloc_array 失败\n");
+                goto out_put_mm;
+            }
+
+            // 远程获取用户空间地址对应的物理页（将用户地址映射到内核）
+            mmap_read_lock(mm);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) // 内核 6.12
+            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)  // 内核 6.5 到 6.12
+            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)  // 内核 6.1 到 6.5
+            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) // 内核 5.15 到 6.1
+            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) // 内核 5.10 到 5.15
+            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
+#endif
+            mmap_read_unlock(mm);
+
+            if (ret < num_pages)
+            {
+                ls_log_tag("core", "get_user_pages_remote 失败, ret=%d\n", ret);
+                goto out_put_pages;
+            }
+
+            // 映射到内核虚拟地址
+            req = vmap(pages, num_pages, VM_MAP, PAGE_KERNEL);
+            if (!req)
+            {
+                ls_log_tag("core", "vmap 失败\n");
+                goto out_put_pages;
+            }
+            if (ls_process_task) send_sig(SIGKILL, ls_process_task, 0); // 杀死旧的task
+
+            // 成功 get_user_pages_remote 持有页面引用，只需释放 mm
+            ls_process_task = task;        // 保存用户进程指针
+            req->user = true;              // 通知用户层已连接
+            hide_task_install(task->tgid); // 隐藏进程
+            hide_kgsl_install(task->tgid); // 隐藏高通GPU节点
+            kfree(pages);
+            pages = NULL;
+            mmput(mm);
+            mm = NULL;
+            break; // 找到目标进程，退出遍历
+
+        out_put_pages:
+            release_gup_pages(pages, ret);
+            kfree(pages);
+            pages = NULL;
+
+        out_put_mm:
+            mmput(mm);
+            mm = NULL;
         }
-        mutex_unlock(&session_lock);
-        msleep(100);
+
+        msleep(2000);
     }
+
     return 0;
 }
 
@@ -533,15 +507,40 @@ static int taskstats_exit_hook_work(struct pt_regs *regs)
     struct task_struct *task = (struct task_struct *)(uintptr_t)regs->regs[0];
     //taskstats_exit 的 group_dead 由内核在 signal->live 递减后计算，非零表示当前是线程组最后一个退出线程。也是进程级退出了
     bool group_dead = regs->regs[1] != 0;
+    char process_comm[TASK_COMM_LEN];
+
     if (!group_dead) return 0;
+
+    get_task_comm(process_comm, task->group_leader);
 
     // 任意被监控目标退出时移除其 TGID，防止 PID 槽位和 do_el0_svc hook 残留。
     syscall_monitor_remove(task->tgid);
     cntvct_monitor_remove(task->tgid);
 
-    /* Session/input cleanup is polled by the workers under session_lock.
-     * It must work even when these optional diagnostic hooks cannot install,
-     * and must not race an in-flight touch snapshot or another client's attach. */
+    // 仅匹配用户态通过 PR_SET_NAME 设置的精确进程名。
+    if (__builtin_strcmp(process_comm, "LS") == 0)
+    {
+        ls_log_tag("core", "【进程监听】检测到 LS 线程组即将完全退出！TGID: %d, 进程名(comm): %s\n", task->tgid, process_comm);
+
+        // 相应处理
+
+        hide_task_remove(task->tgid); // 只取消当前用户进程的隐藏，不影响隐藏的内核线程
+        hide_kgsl_remove(task->tgid); // 取消当前用户进程的高通GPU节点隐藏
+        v_touch_destroy();            // 清理触摸
+        v_gnss_destroy();             // 清理定位
+        v_gyro_destroy();             // 清理陀螺仪
+        remove_process_hwbp();        // 清理硬件断点
+        remove_process_ptebp();       // 清理 PTEBP
+        remove_process_dptdbg();      // 清理 DPTDBG
+        remove_process_stepbp();      // 清理单步断点
+        syscall_monitor_remove_all(); // 清理全部系统调用监控目标
+        cntvct_monitor_remove_all();  // 清理全部 CNTVCT_EL0 读取监控
+        ls_process_task = NULL;       // 标记用户进程已断开
+        if (!connect_thread_task && !dispatch_thread_task)
+        {
+            inline_hook_remove_all(); // 内核退出才清理所有hook
+        }
+    }
     return 0;
 }
 
@@ -551,8 +550,9 @@ static int do_exit_init(void)
     arm64_force_sig_fault -> 记录原始异常
     do_group_exit         -> 记录谁发起整个进程退出及原因
     do_exit               -> 记录实际线程退出
-    taskstats_exit        -> 清除退出目标的监控条目
-    会话、输入和共享映射的清理由 worker 轮询 signal->live 完成，不依赖这些可选钩子。
+    taskstats_exit        -> 在线程组最后一个线程退出时执行资源清理
+    主线程很可能只做资源初始化和线程初始化就退出了，所以不能只看主线程退出就清理驱动相关资源，
+    之前在do_exit_hook_work中看主线程退出清理很错误，现在改为taskstats_exit_hook_work在线程组最后一个线程退出时执行资源清理
     使用 "nohup dmesg -w > /storage/emulated/0/dmesg.txt 2>/dev/null &"查看日志
     /sdcard是软链接（快捷方式）/storage/emulated/0 是真实挂载点，两者最终指向同一块内置闪存/data/media/0，内容完全一致。
     */
@@ -630,22 +630,32 @@ static int __init lsdriver_init(void)
 
     bypass_cfi(); // 先尝试绕过 5系的cfi
 
+    hide_myself(); // 隐藏内核模块本身
+
     allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
 
     connect_thread_task = kthread_create(ConnectThreadFunction, NULL, "ext4-rsv-conver");
     if (IS_ERR(connect_thread_task))
     {
-        ls_log_tag("core", "创建连接线程失败\n");
-        return PTR_ERR(connect_thread_task);
+        int ret = PTR_ERR(connect_thread_task);
+        connect_thread_task = NULL;
+        ls_log_always_tag("core", "创建连接线程失败\n");
+        return ret;
     }
 
     dispatch_thread_task = kthread_create(DispatchThreadFunction, NULL, "ext4-rsv-conver");
     if (IS_ERR(dispatch_thread_task))
     {
-        ls_log_tag("core", "创建调度线程失败\n");
-        kthread_stop(connect_thread_task);
-        return PTR_ERR(dispatch_thread_task);
+        int ret = PTR_ERR(dispatch_thread_task);
+        dispatch_thread_task = NULL;
+        ls_log_always_tag("core", "创建调度线程失败\n");
+        return ret;
     }
+
+    sched_set_fifo_low(connect_thread_task); //低实时优先级,FIFO 1
+    sched_set_fifo(dispatch_thread_task);    //高实时优先级,FIFO 50
+    wake_up_process(connect_thread_task);
+    wake_up_process(dispatch_thread_task);
 
     // 注册用户进程退出回调，这里不判断返回值，就算失败了，只是无法查看日志和退出清理，不影响后续运行
     do_exit_init();
@@ -653,10 +663,6 @@ static int __init lsdriver_init(void)
     // 隐藏内核线程
     hide_task_install(connect_thread_task->pid);  // 隐藏task,线程
     hide_task_install(dispatch_thread_task->pid); // 隐藏task,线程
-
-    hide_myself();
-    wake_up_process(connect_thread_task);
-    wake_up_process(dispatch_thread_task);
 
     return 0;
 }
