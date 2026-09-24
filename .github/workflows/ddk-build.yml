@@ -72,40 +72,46 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "artifacts/${{ matrix.version }}"
+          cat > "$RUNNER_TEMP/ddk-build-inside.sh" <<'CONTAINER_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          bash ddk_build_all.sh "$DDK_VERSION"
+          test -s "lsdriver/$DDK_VERSION.ko"
+          cp "lsdriver/$DDK_VERSION.ko" "artifacts/$DDK_VERSION/"
+          {
+            printf 'driver_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'ddk_target=%s\n' "$DDK_TARGET"
+            printf 'ddk_release=%s\n' "$DDK_RELEASE"
+            printf 'kernel_src=%s\n' "${KERNEL_SRC:-unknown}"
+            if [[ -n "${KERNEL_SRC:-}" && -f "$KERNEL_SRC/.config" ]]; then
+              sha256sum "$KERNEL_SRC/.config"
+              grep -E '^(CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_THIN|ARM64_BTI|MODVERSIONS|EXTENDED_MODVERSIONS|PREEMPT|HZ))=' "$KERNEL_SRC/.config" || true
+            fi
+            if command -v clang >/dev/null 2>&1; then
+              clang --version | head -n 1
+            fi
+            sha256sum "artifacts/$DDK_VERSION/$DDK_VERSION.ko"
+          } > "artifacts/$DDK_VERSION/build-info.txt"
+          if command -v llvm-readelf >/dev/null 2>&1; then
+            llvm-readelf -h "lsdriver/$DDK_VERSION.ko"
+            llvm-readelf -p .modinfo "lsdriver/$DDK_VERSION.ko" || true
+          fi
+          sha256sum "artifacts/$DDK_VERSION/$DDK_VERSION.ko"
+          CONTAINER_SCRIPT
+          chmod +x "$RUNNER_TEMP/ddk-build-inside.sh"
           docker run --rm --platform linux/amd64 \
             -e DDK_TARGET='${{ matrix.kmi }}' \
+            -e DDK_VERSION='${{ matrix.version }}' \
+            -e DDK_RELEASE="$DDK_RELEASE" \
             -e STRIP_CHOICE="$STRIP_CHOICE" \
             -e KERNELS_ROOT=/opt/ddk/kdir \
             -e CLANG_ROOT=/opt/ddk/clang \
             -e DRIVER_SRC=/work/lsdriver \
             -v "$GITHUB_WORKSPACE:/work" \
+            -v "$RUNNER_TEMP/ddk-build-inside.sh:/tmp/ddk-build-inside.sh:ro" \
             -w /work \
             "ghcr.io/ylarod/ddk:${{ matrix.kmi }}-${DDK_RELEASE}" \
-            bash -lc '
-              set -euo pipefail
-              bash ddk_build_all.sh "${{ matrix.version }}"
-              test -s "lsdriver/${{ matrix.version }}.ko"
-              cp "lsdriver/${{ matrix.version }}.ko" "artifacts/${{ matrix.version }}/"
-              {
-                printf 'driver_commit=%s\n' "$(git rev-parse HEAD)"
-                printf 'ddk_target=%s\n' "$DDK_TARGET"
-                printf 'ddk_release=%s\n' "$DDK_RELEASE"
-                printf 'kernel_src=%s\n' "${KERNEL_SRC:-unknown}"
-                if [[ -n "${KERNEL_SRC:-}" && -f "$KERNEL_SRC/.config" ]]; then
-                  sha256sum "$KERNEL_SRC/.config"
-                  grep -E '^(CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_THIN|ARM64_BTI|MODVERSIONS|EXTENDED_MODVERSIONS|PREEMPT|HZ))=' "$KERNEL_SRC/.config" || true
-                fi
-                if command -v clang >/dev/null 2>&1; then
-                  clang --version | head -n 1
-                fi
-                sha256sum "artifacts/${{ matrix.version }}/${{ matrix.version }}.ko"
-              } > "artifacts/${{ matrix.version }}/build-info.txt"
-              if command -v llvm-readelf >/dev/null 2>&1; then
-                llvm-readelf -h "lsdriver/${{ matrix.version }}.ko"
-                llvm-readelf -p .modinfo "lsdriver/${{ matrix.version }}.ko" || true
-              fi
-              sha256sum "artifacts/${{ matrix.version }}/${{ matrix.version }}.ko"
-            '
+            bash /tmp/ddk-build-inside.sh
       - uses: actions/upload-artifact@v4
         with:
           name: ddk-${{ matrix.version }}
