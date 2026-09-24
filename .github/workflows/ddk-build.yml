@@ -19,22 +19,9 @@ on:
         description: Strip debug sections (6.6 and 6.12 remain unstripped)
         type: boolean
         default: false
-  # workflow_dispatch 只有在默认分支(main)上存在该 workflow 时才能从网页触发；
-  # 合并前靠 push 触发验证。
-  push:
-    branches: [codex/ddk-build-fix-20260924]
-    paths:
-      - 'lsdriver/**'
-      - 'ddk_build_all.sh'
-      - 'packer.sh'
-      - '.github/workflows/ddk-build.yml'
 
 permissions:
   contents: read
-
-concurrency:
-  group: ddk-build-${{ github.ref }}-${{ inputs.kernel || 'all' }}
-  cancel-in-progress: true
 
 jobs:
   prepare:
@@ -77,96 +64,57 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      DDK_RELEASE: '20260828'
+      DDK_RELEASE: '20260313'
       STRIP_CHOICE: ${{ inputs.strip && 'y' || 'n' }}
     steps:
       - uses: actions/checkout@v4
       - name: Build module in the matching DDK image
         run: |
           set -euo pipefail
-          mkdir -p "artifacts/${{ matrix.version }}" logs
+          mkdir -p "artifacts/${{ matrix.version }}"
+          cat > "$RUNNER_TEMP/ddk-build-inside.sh" <<'CONTAINER_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          bash ddk_build_all.sh "$DDK_VERSION"
+          test -s "lsdriver/$DDK_VERSION.ko"
+          cp "lsdriver/$DDK_VERSION.ko" "artifacts/$DDK_VERSION/"
+          {
+            printf 'driver_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'ddk_target=%s\n' "$DDK_TARGET"
+            printf 'ddk_release=%s\n' "$DDK_RELEASE"
+            printf 'kernel_src=%s\n' "${KERNEL_SRC:-unknown}"
+            if [[ -n "${KERNEL_SRC:-}" && -f "$KERNEL_SRC/.config" ]]; then
+              sha256sum "$KERNEL_SRC/.config"
+              grep -E '^(CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_THIN|ARM64_BTI|MODVERSIONS|EXTENDED_MODVERSIONS|PREEMPT|HZ))=' "$KERNEL_SRC/.config" || true
+            fi
+            if command -v clang >/dev/null 2>&1; then
+              clang --version | head -n 1
+            fi
+            sha256sum "artifacts/$DDK_VERSION/$DDK_VERSION.ko"
+          } > "artifacts/$DDK_VERSION/build-info.txt"
+          if command -v llvm-readelf >/dev/null 2>&1; then
+            llvm-readelf -h "lsdriver/$DDK_VERSION.ko"
+            llvm-readelf -p .modinfo "lsdriver/$DDK_VERSION.ko" || true
+          fi
+          sha256sum "artifacts/$DDK_VERSION/$DDK_VERSION.ko"
+          CONTAINER_SCRIPT
+          chmod +x "$RUNNER_TEMP/ddk-build-inside.sh"
           docker run --rm --platform linux/amd64 \
             -e DDK_TARGET='${{ matrix.kmi }}' \
+            -e DDK_VERSION='${{ matrix.version }}' \
             -e DDK_RELEASE="$DDK_RELEASE" \
             -e STRIP_CHOICE="$STRIP_CHOICE" \
-            -e DRIVER_COMMIT="$GITHUB_SHA" \
             -e KERNELS_ROOT=/opt/ddk/kdir \
             -e CLANG_ROOT=/opt/ddk/clang \
             -e DRIVER_SRC=/work/lsdriver \
             -v "$GITHUB_WORKSPACE:/work" \
+            -v "$RUNNER_TEMP/ddk-build-inside.sh:/tmp/ddk-build-inside.sh:ro" \
             -w /work \
             "ghcr.io/ylarod/ddk:${{ matrix.kmi }}-${DDK_RELEASE}" \
-            bash -lc '
-              set -euo pipefail
-              bash ddk_build_all.sh "${{ matrix.version }}"
-              test -s "lsdriver/${{ matrix.version }}.ko"
-              cp "lsdriver/${{ matrix.version }}.ko" "artifacts/${{ matrix.version }}/"
-              cp "$KERNEL_SRC/.config" "artifacts/${{ matrix.version }}/kernel.config" || true
-              {
-                printf "driver_commit=%s\n" "$DRIVER_COMMIT"
-                printf "ddk_target=%s\n" "$DDK_TARGET"
-                printf "ddk_release=%s\n" "$DDK_RELEASE"
-                printf "kernel_src=%s\n" "${KERNEL_SRC:-unknown}"
-                if [[ -n "${KERNEL_SRC:-}" && -f "$KERNEL_SRC/.config" ]]; then
-                  grep -E "^(CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|ARM64_BTI|ARM64_BTI_KERNEL|MODVERSIONS|EXTENDED_MODVERSIONS|PREEMPT|HZ))=" "$KERNEL_SRC/.config" || true
-                fi
-                clang --version | head -n 1
-                modinfo "lsdriver/${{ matrix.version }}.ko" || true
-                sha256sum "artifacts/${{ matrix.version }}/${{ matrix.version }}.ko"
-              } > "artifacts/${{ matrix.version }}/build-info.txt"
-              llvm-readelf -h "lsdriver/${{ matrix.version }}.ko"
-              echo "---- __versions (应为空: 与官方 no-CRC 构建一致) ----"
-              llvm-readelf -S "lsdriver/${{ matrix.version }}.ko" | grep -E "__versions|__version_ext" || true
-              cat "artifacts/${{ matrix.version }}/build-info.txt"
-              chown -R "$(stat -c %u:%g /work)" /work/lsdriver /work/artifacts
-            ' 2>&1 | tee "logs/${{ matrix.version }}.log"
+            bash /tmp/ddk-build-inside.sh
       - uses: actions/upload-artifact@v4
         with:
           name: ddk-${{ matrix.version }}
           path: artifacts/${{ matrix.version }}/
-          if-no-files-found: error
-          retention-days: 30
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ddk-log-${{ matrix.version }}
-          path: logs/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  package:
-    name: Package DDK drivers
-    needs: [prepare, build]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: ddk-[0-9]*
-          path: downloaded
-      - name: Package this run's DDK modules
-        run: |
-          set -euo pipefail
-          rm -f lsdriver/*-Android*.ko
-          mkdir -p release/modules
-          for ko in downloaded/ddk-*/*-Android*.ko; do
-            cp "$ko" lsdriver/
-            cp "$ko" release/modules/
-          done
-          ls -l lsdriver/*-Android*.ko
-          bash packer.sh
-          bash -n install_driver.sh
-          cp install_driver.sh release/
-          (cd release && sha256sum install_driver.sh modules/*.ko > SHA256SUMS)
-          {
-            echo '### DDK 编译完成'
-            echo '下载 lsdriver-ddk-package（install_driver.sh + 各版本 .ko + SHA256SUMS）。'
-            echo '注意：DDK 没有 android17-6.18，该版本请继续用官方 build-driver.yml。'
-            ls release/modules
-          } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lsdriver-ddk-package
-          path: release/
           if-no-files-found: error
           retention-days: 30
