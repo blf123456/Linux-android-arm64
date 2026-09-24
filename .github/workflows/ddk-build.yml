@@ -79,11 +79,12 @@ jobs:
           test -s "lsdriver/$DDK_VERSION.ko"
           cp "lsdriver/$DDK_VERSION.ko" "artifacts/$DDK_VERSION/"
           {
-            printf 'driver_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'driver_commit=%s\n' "$DRIVER_COMMIT"
             printf 'ddk_target=%s\n' "$DDK_TARGET"
             printf 'ddk_release=%s\n' "$DDK_RELEASE"
             printf 'kernel_src=%s\n' "${KERNEL_SRC:-unknown}"
             if [[ -n "${KERNEL_SRC:-}" && -f "$KERNEL_SRC/.config" ]]; then
+              cp "$KERNEL_SRC/.config" "artifacts/$DDK_VERSION/kernel.config"
               sha256sum "$KERNEL_SRC/.config"
               grep -E '^(CONFIG_(CFI_CLANG|LTO_CLANG|LTO_CLANG_THIN|ARM64_BTI|MODVERSIONS|EXTENDED_MODVERSIONS|PREEMPT|HZ))=' "$KERNEL_SRC/.config" || true
             fi
@@ -103,6 +104,7 @@ jobs:
             -e DDK_TARGET='${{ matrix.kmi }}' \
             -e DDK_VERSION='${{ matrix.version }}' \
             -e DDK_RELEASE="$DDK_RELEASE" \
+            -e DRIVER_COMMIT="$GITHUB_SHA" \
             -e STRIP_CHOICE="$STRIP_CHOICE" \
             -e KERNELS_ROOT=/opt/ddk/kdir \
             -e CLANG_ROOT=/opt/ddk/clang \
