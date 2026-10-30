@@ -636,8 +636,8 @@ static void remove_process_hwbp(void)
     if (info) __builtin_memset(info, 0, sizeof(*info));
 }
 
-//#include "arm64_ptedbg.h"
-#include "arm64_ptedbg-20260822-000439.h"
+#include "arm64_ptedbg.h"
+//#include "arm64_ptedbg-20260822-000439.h"
 static int set_process_ptebp(struct break_point *info)
 {
     if (!info) return -EINVAL;
