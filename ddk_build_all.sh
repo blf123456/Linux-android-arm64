@@ -31,6 +31,7 @@ STRIP_CHOICE="${STRIP_CHOICE:-n}"
 
 # Canonical names are the names consumed by packer.sh and install_driver.sh.
 ALL_VERSIONS=(
+    '6.18-Android17'
     '6.12-Android16'
     '6.6-Android15'
     '6.1-Android14'
@@ -40,6 +41,7 @@ ALL_VERSIONS=(
 )
 
 declare -A KMI_FOR_VERSION=(
+    ['6.18-Android17']='android17-6.18'
     ['6.12-Android16']='android16-6.12'
     ['6.6-Android15']='android15-6.6'
     ['6.1-Android14']='android14-6.1'
@@ -49,6 +51,7 @@ declare -A KMI_FOR_VERSION=(
 )
 
 declare -A CLANG_FOR_VERSION=(
+    ['6.18-Android17']='clang-r584948c'
     ['6.12-Android16']='clang-r536225'
     ['6.6-Android15']='clang-r510928'
     ['6.1-Android14']='clang-r487747c'
@@ -59,7 +62,7 @@ declare -A CLANG_FOR_VERSION=(
 
 # The newest DDK targets must retain their symbol/debug sections. The default
 # is already no-strip; this list also protects an explicit STRIP_CHOICE=y.
-NO_STRIP_VERSIONS=('6.12-Android16' '6.6-Android15')
+NO_STRIP_VERSIONS=('6.18-Android17' '6.12-Android16' '6.6-Android15')
 
 log_info()  { echo -e "${GREEN}$*${NC}"; }
 log_warn()  { echo -e "${YELLOW}$*${NC}"; }
@@ -78,6 +81,7 @@ contains_version() {
 
 normalize_version() {
     case "$1" in
+        6.18-Android17|android17-6.18) echo '6.18-Android17' ;;
         6.12-Android16|android16-6.12) echo '6.12-Android16' ;;
         6.6-Android15|android15-6.6)   echo '6.6-Android15' ;;
         6.1-Android14|android14-6.1)   echo '6.1-Android14' ;;

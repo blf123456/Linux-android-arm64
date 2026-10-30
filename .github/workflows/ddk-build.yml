@@ -9,6 +9,7 @@ on:
         default: all
         options:
           - all
+          - 6.18-Android17
           - 6.12-Android16
           - 6.6-Android15
           - 6.1-Android14
@@ -16,7 +17,7 @@ on:
           - 5.10-Android13
           - 5.10-Android12
       strip:
-        description: Strip debug sections (6.6 and 6.12 remain unstripped)
+        description: Strip debug sections (6.6, 6.12 and 6.18 remain unstripped)
         type: boolean
         default: false
 
@@ -39,12 +40,15 @@ jobs:
           import os
 
           targets = [
-              {'version': '6.12-Android16', 'kmi': 'android16-6.12'},
-              {'version': '6.6-Android15', 'kmi': 'android15-6.6'},
-              {'version': '6.1-Android14', 'kmi': 'android14-6.1'},
-              {'version': '5.15-Android13', 'kmi': 'android13-5.15'},
-              {'version': '5.10-Android13', 'kmi': 'android13-5.10'},
-              {'version': '5.10-Android12', 'kmi': 'android12-5.10'},
+              # ghcr.io/ylarod/ddk only ships android17-6.18 from the 20260828 release on;
+              # the other KMIs stay pinned to the 20260313 images they were validated on.
+              {'version': '6.18-Android17', 'kmi': 'android17-6.18', 'ddk_release': '20260828'},
+              {'version': '6.12-Android16', 'kmi': 'android16-6.12', 'ddk_release': '20260313'},
+              {'version': '6.6-Android15', 'kmi': 'android15-6.6', 'ddk_release': '20260313'},
+              {'version': '6.1-Android14', 'kmi': 'android14-6.1', 'ddk_release': '20260313'},
+              {'version': '5.15-Android13', 'kmi': 'android13-5.15', 'ddk_release': '20260313'},
+              {'version': '5.10-Android13', 'kmi': 'android13-5.10', 'ddk_release': '20260313'},
+              {'version': '5.10-Android12', 'kmi': 'android12-5.10', 'ddk_release': '20260313'},
           ]
           selected = os.environ['SELECTED_KERNEL']
           if selected != 'all':
@@ -64,7 +68,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      DDK_RELEASE: '20260313'
+      DDK_RELEASE: ${{ matrix.ddk_release }}
       STRIP_CHOICE: ${{ inputs.strip && 'y' || 'n' }}
     steps:
       - uses: actions/checkout@v4
