@@ -270,6 +270,19 @@ struct virtual_memoryrw
     int size;                    // 读写的大小
 };
 
+// 内核 UDP 抓包信息（算法解密3；布局双侧一致，只追加不重排）
+struct udp_capture_ctrl
+{
+    int32_t pid;               // udp_init: 目标进程（内核解析 UID 过滤）
+    uint16_t min_payload;      // 载荷下限过滤
+    uint16_t max_payload;      // 载荷上限过滤（≤2048）
+    uint32_t consume_count;    // udp_read: 读侧已消费的槽数（推进 reader_ack）
+    // udp_read 应答（内核填）：
+    uint64_t out_write_seq;    // 内核已写入的总序号
+    uint32_t out_dropped;      // 因 ring 满/过滤丢弃累计
+    uint32_t out_active;       // 抓包是否在跑
+};
+
 enum request_op
 {
     request_op_none,       // 空调用
@@ -309,6 +322,9 @@ enum request_op
     request_op_env_get_params, // 获取指定task环境参数
 
     request_op_kernel_exit, // 内核线程退出
+    request_op_udp_init, // 启动内核 UDP 下行抓包（kprobe，UID 过滤）
+    request_op_udp_read, // 消费推进：读侧已消费 consume_count 个槽
+    request_op_udp_stop, // 停止抓包并清 ring
 };
 
 // 将在队列中使用的请求实例结构体
@@ -358,5 +374,53 @@ struct request_obj
     struct break_point bp_info;
     // 环境参数信息
     struct env_params env_info;
+    // 内核 UDP 抓包信息（算法解密3；布局双侧一致，只追加不重排）
+    struct udp_capture_ctrl udp_ctrl;
 };
+
+//==================== 共享页 UDP 环（契约 §3，request_obj 之后的独立区）====================
+// 内核 kprobe 直写、用户直读；消费推进走 request_op_udp_read。
+// 注意：本驱动 request_obj 含 vmem_info 大数组，连尾部 udp_ctrl 共 13339968 字节（约13MB），
+// 契约初版的 0x4000 偏移与「request_obj 之后的独立区」矛盾，已按内核侧勘察调整为
+// request_obj 之后的第一个 4K 对齐边界（双侧按同一结构定义计算，天然一致；
+// 偏差记录见 UDP_PORT_CONTRACT.md §7）。
+#define LS_UDP_SLOT_COUNT   16
+#define LS_UDP_SLOT_PAYLOAD 2048
+#define LS_UDP_SLOT_SIZE    2112        // 32B 头 + 2048 载荷 + 32 对齐余量
+#define LS_UDP_RING_MAGIC   0x5044554CU // 'L','U','D','P'
+#define LS_UDP_RING_HEADER_SIZE 64      // 环头区起点到第一个槽的间距（环头本身 32 字节，其余保留垫）
+#define LS_UDP_RING_BYTES   (LS_UDP_RING_HEADER_SIZE + LS_UDP_SLOT_COUNT * LS_UDP_SLOT_SIZE)
+// 环区起点：request_obj 之后的第一个 4K 对齐边界
+#define LS_UDP_RING_OFFSET  (((sizeof(struct request_obj)) + 0xFFFULL) & ~0xFFFULL)
+
+struct udp_ring_slot
+{
+    uint64_t seq;            // 内核单调递增（0 = 空槽）
+    uint64_t ts_ns;
+    uint32_t len;            // 实际载荷长度
+    uint32_t flags;          // bit0 = 截断
+    uint32_t src_ip, dst_ip; // 网络序
+    uint16_t sport, dport;
+    uint16_t uid;
+    uint16_t reserved;
+    uint8_t payload[LS_UDP_SLOT_PAYLOAD];
+};
+
+// 环头（LS_UDP_RING_OFFSET 处，槽从 LS_UDP_RING_OFFSET + LS_UDP_RING_HEADER_SIZE 开始）
+struct udp_ring_header
+{
+    uint32_t magic;               // 'L','U','D','P' = LS_UDP_RING_MAGIC
+    uint32_t active;              // 抓包运行中
+    volatile uint32_t write_idx;  // 内核生产者（自旋锁内递增，模 LS_UDP_SLOT_COUNT）
+    volatile uint32_t reader_ack; // 用户消费推进（request_op_udp_read 写）
+    uint32_t dropped;             // 丢弃累计
+    uint32_t reserved;
+    uint64_t write_seq;           // 已写入总序号
+};
+
+// request_obj 总大小必须 < LS_UDP_RING_OFFSET（契约 §4；环区独立不重叠的前提）
+_Static_assert(sizeof(struct request_obj) < LS_UDP_RING_OFFSET, "request_obj must end before LS_UDP_RING_OFFSET");
+_Static_assert(sizeof(struct udp_ring_header) <= LS_UDP_RING_HEADER_SIZE, "udp ring header must fit in the reserved header area");
+_Static_assert(LS_UDP_SLOT_SIZE >= sizeof(struct udp_ring_slot), "LS_UDP_SLOT_SIZE stride must cover struct udp_ring_slot");
+
 #endif // IO_STRUCT_H

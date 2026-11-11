@@ -35,8 +35,11 @@
 #include "virtual_memory_enum.h"
 #include "break_point.h"
 #include "network/ipv4_ping.h"
+#include "udp_capture.h"
 
 static struct request_obj *req = NULL;
+// vmap 覆盖的字节数（request_obj 区 + 可选的 UDP 环区），udp_init 用它判断环区是否已映射
+static size_t ls_shared_map_bytes = 0;
 
 /*
 volatile 约束，这三个指针的每次读写都按易变访问处理，
@@ -148,7 +151,17 @@ static int DispatchThreadFunction(void *data)
                 case request_op_env_get_params:
                     __atomic_store_n(&req->status, get_env_params(req->tgid, req->env_info.thread_name, &req->env_info.tpidr_el0, &req->env_info.pacga_lo, &req->env_info.pacga_hi, &req->env_info.tls_status, &req->env_info.pacga_status), __ATOMIC_RELAXED);
                     break;
+                case request_op_udp_init:
+                    __atomic_store_n(&req->status, udp_capture_init((uint8_t *)req, ls_shared_map_bytes, &req->udp_ctrl), __ATOMIC_RELAXED);
+                    break;
+                case request_op_udp_read:
+                    __atomic_store_n(&req->status, udp_capture_read(&req->udp_ctrl), __ATOMIC_RELAXED);
+                    break;
+                case request_op_udp_stop:
+                    __atomic_store_n(&req->status, udp_capture_stop(), __ATOMIC_RELAXED);
+                    break;
                 case request_op_kernel_exit:
+                    udp_capture_stop(); // 内核线程退出前停止 UDP 抓包并清环
                     hide_task_remove(connect_thread_task->pid);
                     hide_task_remove(dispatch_thread_task->pid);
                     connect_thread_task = NULL;  // 标记连接线程退出
@@ -188,6 +201,17 @@ static int DispatchThreadFunction(void *data)
     return 0;
 }
 
+// 远程获取用户空间地址对应的物理页（将用户地址映射到内核）
+// 6.5 起去掉 locked 出参（6 参数），5.10/5.15/6.1 走旧 7 参数签名；行为与原先的版本判断链一致
+static int lsdriver_gup_remote(struct mm_struct *mm, unsigned long start, int nr_pages, struct page **pages)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+    return get_user_pages_remote(mm, start, nr_pages, FOLL_WRITE, pages, NULL);
+#else
+    return get_user_pages_remote(mm, start, nr_pages, FOLL_WRITE, pages, NULL, NULL);
+#endif
+}
+
 static int ConnectThreadFunction(void *data)
 {
     struct task_struct *task;
@@ -195,6 +219,7 @@ static int ConnectThreadFunction(void *data)
     struct mm_struct *mm = NULL;
     struct page **pages = NULL;
     int num_pages;
+    int udp_ring_pages;
     int ret;
 
     // 和内核线程在运行
@@ -216,32 +241,33 @@ static int ConnectThreadFunction(void *data)
             mm = get_task_mm(task);
             if (!mm) continue;
 
-            // 计算页数
+            // 计算页数：request_obj 区；UDP 共享环在 request_obj 之后的独立区（LS_UDP_RING_OFFSET），
+            // 用户态 mmap 覆盖到环区时多 pin 出这部分页；没覆盖（旧版客户端）时降级为只映射 request 区，
+            // 之后 udp_init 会因环区越界返回 -ENOMEM，其余请求不受影响
             num_pages = (sizeof(struct request_obj) + PAGE_SIZE - 1) / PAGE_SIZE;
+            udp_ring_pages = (LS_UDP_RING_OFFSET + LS_UDP_RING_BYTES + PAGE_SIZE - 1) / PAGE_SIZE - num_pages;
 
             // 分配页指针数组
-            pages = kmalloc_array(num_pages, sizeof(struct page *), GFP_KERNEL);
+            pages = kmalloc_array(num_pages + udp_ring_pages, sizeof(struct page *), GFP_KERNEL);
             if (!pages)
             {
                 ls_log_always_tag("core", "kmalloc_array 失败\n");
                 goto out_put_mm;
             }
 
-            // 远程获取用户空间地址对应的物理页（将用户地址映射到内核）
             mmap_read_lock(mm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0) // 内核 6.18 及以上
-            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) // 内核 6.12 到 6.18
-            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)  // 内核 6.5 到 6.12
-            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)  // 内核 6.1 到 6.5
-            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) // 内核 5.15 到 6.1
-            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) // 内核 5.10 到 5.15
-            ret = get_user_pages_remote(mm, 0x2025827000, num_pages, FOLL_WRITE, pages, NULL, NULL);
-#endif
+            ret = lsdriver_gup_remote(mm, 0x2025827000, num_pages, pages);
+            if (ret == num_pages && udp_ring_pages > 0)
+            {
+                int ring_ret = lsdriver_gup_remote(mm, 0x2025827000 + (unsigned long)num_pages * PAGE_SIZE, udp_ring_pages, pages + num_pages);
+
+                if (ring_ret < udp_ring_pages)
+                {
+                    if (ring_ret > 0) release_pages(pages + num_pages, ring_ret);
+                    udp_ring_pages = 0;
+                    ls_log_always_tag("core", "UDP 环区共享页未映射，抓包功能降级禁用\n");
+                }
+            }
             mmap_read_unlock(mm);
 
             if (ret < num_pages)
@@ -250,13 +276,15 @@ static int ConnectThreadFunction(void *data)
                 goto out_put_pages;
             }
 
-            // 映射到内核虚拟地址
-            req = vmap(pages, num_pages, VM_MAP, PAGE_KERNEL);
+            // 映射到内核虚拟地址（含降级后的 UDP 环区页数）
+            ret = num_pages + udp_ring_pages; // vmap 失败时 out_put_pages 按全部已 pin 页数释放
+            req = vmap(pages, num_pages + udp_ring_pages, VM_MAP, PAGE_KERNEL);
             if (!req)
             {
                 ls_log_always_tag("core", "vmap 失败\n");
                 goto out_put_pages;
             }
+            ls_shared_map_bytes = (size_t)(num_pages + udp_ring_pages) * PAGE_SIZE;
             old_task = ls_process_task;
             if (old_task && !(READ_ONCE(old_task->flags) & PF_EXITING)) send_sig(SIGKILL, old_task, 0); // 杀死旧的task线程组
 
@@ -558,6 +586,7 @@ static int taskstats_exit_hook_work(struct pt_regs *regs)
         syscall_monitor_remove_all();     // 清理全部系统调用监控目标
         cntvct_monitor_remove_all();      // 清理全部 CNTVCT_EL0 读取监控
         virtual_memory_rw(0, 0, 0, 0, 0); // 清理缓存 mm 引用
+        udp_capture_exit();               // 清理 UDP 抓包（注销 kprobe）
         ls_process_task = NULL;           // 标记用户进程已断开
         if (!connect_thread_task && !dispatch_thread_task)
         {
@@ -792,6 +821,7 @@ static int __init lsdriver_init(void)
 static void __exit lsdriver_exit(void)
 {
     // 模块已隐藏，此函数不会被调用
+    udp_capture_exit(); // 注销 UDP 抓包 kprobe
 }
 
 module_init(lsdriver_init);
