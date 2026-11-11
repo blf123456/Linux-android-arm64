@@ -381,17 +381,20 @@ struct request_obj
 //==================== 共享页 UDP 环（契约 §3，request_obj 之后的独立区）====================
 // 内核 kprobe 直写、用户直读；消费推进走 request_op_udp_read。
 // 注意：本驱动 request_obj 含 vmem_info 大数组，连尾部 udp_ctrl 共 13339968 字节（约13MB），
-// 契约初版的 0x4000 偏移与「request_obj 之后的独立区」矛盾，已按内核侧勘察调整为
-// request_obj 之后的第一个 4K 对齐边界（双侧按同一结构定义计算，天然一致；
-// 偏差记录见 UDP_PORT_CONTRACT.md §7）。
+// 契约初版的 0x4000 偏移与「request_obj 之后的独立区」矛盾，已修正为 request_obj 之后的
+// 第一个 4K 对齐页边界：LS_UDP_RING_OFFSET = 0xCB9000 = 3257*4096 = 13340672
+// （= (sizeof(struct request_obj) + 0xFFF) & ~0xFFF，双侧镜像同一值；偏差记录见
+// UDP_PORT_CONTRACT.md §7）。注意不能取 0xCB8000（=13336576=3256*4096，小于 request_obj
+// 总大小，会压到 env_info/udp_ctrl 尾部且 static_assert 编不过）。
 #define LS_UDP_SLOT_COUNT   16
 #define LS_UDP_SLOT_PAYLOAD 2048
 #define LS_UDP_SLOT_SIZE    2112        // 32B 头 + 2048 载荷 + 32 对齐余量
 #define LS_UDP_RING_MAGIC   0x5044554CU // 'L','U','D','P'
 #define LS_UDP_RING_HEADER_SIZE 64      // 环头区起点到第一个槽的间距（环头本身 32 字节，其余保留垫）
-#define LS_UDP_RING_BYTES   (LS_UDP_RING_HEADER_SIZE + LS_UDP_SLOT_COUNT * LS_UDP_SLOT_SIZE)
-// 环区起点：request_obj 之后的第一个 4K 对齐边界
-#define LS_UDP_RING_OFFSET  (((sizeof(struct request_obj)) + 0xFFFULL) & ~0xFFFULL)
+#define LS_UDP_RING_BYTES   (LS_UDP_RING_HEADER_SIZE + LS_UDP_SLOT_COUNT * LS_UDP_SLOT_SIZE) // = 33856
+// 环区起点：request_obj 之后的第一个 4K 对齐页边界（当前布局下即 0xCB9000）
+#define LS_UDP_RING_OFFSET  0xCB9000
+_Static_assert(LS_UDP_RING_OFFSET == (((sizeof(struct request_obj)) + 0xFFFULL) & ~0xFFFULL), "LS_UDP_RING_OFFSET must stay page-aligned right after struct request_obj");
 
 struct udp_ring_slot
 {
